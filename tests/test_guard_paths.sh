@@ -326,56 +326,62 @@ test_more_recursive_readers() {
   _blocked "Glob base uses every spelling of path" || return 1
 }
 
-test_cd_position() {
+test_cd_position() { # R8, union form: the session cwd and every cd target count
   t_two_profiles
   mkdir -p "$HOME/repo/sub"
-  _sh work 'cd ~/repo && grep -rn foo .' "$HOME"
-  _allowed "grep -r . after cd into a repo" || return 1
-  _sh work 'cd repo && find . -name x' "$HOME"
-  _allowed "find . after cd into a repo" || return 1
-  _sh work 'cd ~/repo; cat .claude/x' "$HOME"
-  _allowed "relative path after cd is not from the old cwd" || return 1
+  local c
+  for c in 'cd ~/repo && grep -rn foo .' 'cd repo && find . -name x' 'cd ~/repo; cat .claude/x' \
+           '(cd ~/repo && ls); grep -r foo .' 'cd ~/repo && cd "$CA_UNSET_DIR" && cat .claude/x' \
+           'cd - && cat .claude/x' 'cd ~/repo && cd sub && cat .claude/x'; do
+    _sh work "$c" "$HOME"
+    _blocked "cwd home, the cwd still counts: $c" || return 1
+  done
   _sh work 'cd ~ && cat .claude/x' "$HOME/repo"
   _blocked "cd home, then a relative path" || return 1
-  _sh work '(cd ~/repo && ls); grep -r foo .' "$HOME"
-  _blocked "a subshell gives the cwd back" || return 1
-  _sh work 'cd ~/repo && cd "$CA_UNSET_DIR" && cat .claude/x' "$HOME"
-  _blocked "unknown cd target: the session cwd is checked too" || return 1
-  _sh work 'cd - && cat .claude/x' "$HOME"
-  _blocked "cd -: the session cwd is checked too" || return 1
-  _sh work 'cd ~/repo && cd sub && cat .claude/x' "$HOME"
-  _allowed "chain of known cd targets" || return 1
+  _sh work 'cd sub && cat .claude/x' "$HOME/repo"
+  _allowed "cd into a subfolder" || return 1
 }
 
-test_cd_that_may_not_move() {
+test_cd_anywhere_counts() {
   t_two_profiles
   mkdir -p "$HOME/repo/sub"
   echo n > "$HOME/notes.txt"
-  local c
+  local c nl=$'\n'
   for c in 'cd ~/nosuch; cat .claude/x' 'cd ~/notes.txt; cat .claude/x' 'cd /nonexistent; grep -r foo .' \
            'cd ~/repo/x 2>/dev/null; rg --hidden foo' 'cd ~/repo | grep -r foo .' 'cd ~/repo | cat .claude/x' \
-           'cd ~/repo & cat .claude/x' 'cd ~/repo || cat .claude/x' 'cd ~/repo && true || cat .claude/x' \
-           'false && cd ~/repo; cat .claude/x' 'true || cd ~/repo; cat .claude/x' \
-           '! cd ~/repo && cat .claude/x' 'if cd ~/repo; then :; fi; cat .claude/x' \
-           'f() { cd ~/repo; }; cat .claude/x' 'case x in y) cd ~/repo;; esac; cat .claude/x' \
-           'cd ~/repo && ls & cat .claude/x' 'ls | cd ~/repo; cat .claude/x'; do
+           'cd ~/repo & cat .claude/x' 'cd ~/repo || cat .claude/x' \
+           'if false; then :; cd ~/repo; fi; cat .claude/x' \
+           "if false${nl}then${nl}  cd ~/repo${nl}fi${nl}cat .claude/x" \
+           "[ -f x ] && {${nl} cd ~/repo${nl}}${nl}grep -rn foo ." \
+           'f() { :; cd ~/repo; }; cat .claude/x' 'for i in 1; do cd ~/repo; done; cat .claude/x' \
+           'while false; do :; cd ~/repo; done; cat .claude/x' 'case x in (y) cd ~/repo;; esac; cat .claude/x' \
+           'cd ~/repo; cd -; cat .claude/x' 'pushd ~/repo; popd; cat .claude/x'; do
     _sh work "$c" "$HOME"
     _blocked "cwd home: $c" || return 1
   done
-  for c in 'if cd ~; then cat .claude/x; fi' '{ cd ~; }; cat .claude/x' 'builtin cd ~; cat .claude/x' \
-           'command cd ~ && cat .claude/x' 'X=1 cd ~ && grep -r foo .'; do
+  for c in 'time cd ~; cat .claude/x' 'noglob cd ~; cat .claude/x' 'chdir ~; cat .claude/x' \
+           'eval cd ~; cat .claude/x' 'eval "cd ~"; cat .claude/x' 'builtin cd -P -- ~ && cat .claude/x' \
+           'if false; then cd ~; fi; cat .claude/x' "cat <<EOF${nl}cd ~${nl}EOF${nl}cat .claude/x" \
+           'cat .claude/x # cd ~' 'cd ~; cd ~/repo; cd -; cat .claude/x' \
+           'cd ~; cd ~/repo; cd "$OLDPWD"; cat .claude/x' 'pushd ~; pushd ~/repo; popd; cat .claude/x' \
+           'cd ~/repo/sub; cd ../.. && cat .claude/x' 'cd ..; cd repo; cat ../.claude/x'; do
     _sh work "$c" "$HOME/repo"
     _blocked "cwd repo: $c" || return 1
   done
-  mkdir "$HOME/locked"; chmod 000 "$HOME/locked"
-  _sh work 'cd ~/locked; cat .claude/x' "$HOME"
-  chmod 755 "$HOME/locked"
-  _blocked "cd into a folder that cannot be entered" || return 1
-  for c in 'cd ~/repo; cat .claude/x' 'cd ~/repo && cat .claude/x' 'cd ~/repo && cd sub && cat .claude/x' \
-           'builtin cd ~/repo; cat .claude/x' 'cd ~/repo && ls | cat .claude/x' 'cd ~/repo; ls & cat .claude/x' \
-           '(cd ~/nosuch); cd ~/repo; cat .claude/x'; do
-    _sh work "$c" "$HOME"
-    _allowed "cwd home: $c" || return 1
+}
+
+test_cd_normal_repo_work() {
+  t_two_profiles
+  mkdir -p "$HOME/repo/sub"
+  local c i ten=''
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    mkdir -p "$HOME/repo/m$i"
+    ten="${ten}cd m$i || exit 1; make; cd ..; "
+  done
+  for c in 'cd sub && make && cd ..' 'mkdir -p build && cd build && cmake ..' 'pushd sub && make && popd' \
+           '(cd sub && make)' "$ten" "${ten//m/n}" 'cd sub; grep -rn foo .' 'cd sub && cat .claude/x'; do
+    _sh work "$c" "$HOME/repo"
+    _allowed "cwd repo: ${c:0:60}" || return 1
   done
 }
 
@@ -550,8 +556,13 @@ test_cd_targets() {
   _blocked "cd inside a quoted command" || return 1
   _sh work 'cd a; cd b; cd c; cd d; cd e; cd f; cd g; cd h; cat x' "$HOME/repo"
   _allowed "many cd targets" || return 1
+  mkdir -p "$HOME/repo/a/b/c/d/e"
   _sh work 'cd a; cd b; cd c; cd d; cd e; cd ../../../../../..; cat .claude/x' "$HOME/repo"
   _blocked "chain of cd ends at home" || return 1
+  local i many=''
+  for i in $(seq 1 70); do many="${many}cd /tmp/ca-none-$i; "; done
+  _sh work "$many" "$HOME/repo"
+  _guard_error "more than 64 cd folders" || return 1
 }
 
 test_recursive_ancestor_blocked() {
