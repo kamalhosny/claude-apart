@@ -4,6 +4,8 @@ use warnings;
 use FindBin ();
 use lib "$FindBin::Bin/../../lib";
 use ClaudeApart::Config;
+use ClaudeApart::Identity;
+use ClaudeApart::Herdr;
 
 sub usage { print STDERR "usage: capart.pl config <profiles|shell|default|set|set-profile|add-profile|remove-profile> ...\n"; return 2 }
 
@@ -54,11 +56,81 @@ sub cmd_config {
     return 0;
 }
 
+sub session_profile {
+    my ($cfg) = @_;
+    my $env = $ENV{CLAUDE_APART_PROFILE};
+    if (defined $env && length $env) {
+        return ClaudeApart::Config::profile($cfg, $env) ? $env : undef;
+    }
+    my $cd = $ENV{CLAUDE_CONFIG_DIR};
+    if (defined $cd && length $cd) {
+        $cd =~ s{(?<=.)/+\z}{};
+        for my $n (ClaudeApart::Config::profile_names($cfg)) {
+            my $p = ClaudeApart::Config::profile($cfg, $n);
+            return $n if !$p->{adopted} && $p->{abs_dir} eq $cd;
+        }
+        return undef;
+    }
+    for my $n (ClaudeApart::Config::profile_names($cfg)) {
+        return $n if ClaudeApart::Config::profile($cfg, $n)->{adopted};
+    }
+    return undef;
+}
+
+# rc 0 = name printed, 5 = refused (inside a session), 6 = nothing resolvable
+sub cmd_resolve {
+    my (@a) = @_;
+    my $explicit;
+    while (@a) {
+        my $f = shift @a;
+        if ($f eq "--explicit" && @a) { $explicit = shift @a } else { return usage() }
+    }
+    my $cfg = ClaudeApart::Config::load(ClaudeApart::Config::config_path());
+    die "unknown profile: $explicit\n" if defined $explicit && !ClaudeApart::Config::profile($cfg, $explicit);
+    my $pick;
+    if (($ENV{CLAUDE_CODE_CHILD_SESSION} || "") eq "1") {
+        my $own = session_profile($cfg);
+        unless (defined $own) { print STDERR "claude-apart: cannot tell which profile this session uses.\n"; return 6 }
+        if (defined $explicit && $explicit ne $own) {
+            print STDERR "claude-apart: cannot start another profile from inside a session.\n";
+            return 5;
+        }
+        $pick = $own;
+    } elsif (defined $explicit) {
+        $pick = $explicit;
+    } elsif (defined $ENV{CLAUDE_APART_PROFILE} && length $ENV{CLAUDE_APART_PROFILE}) {
+        $pick = $ENV{CLAUDE_APART_PROFILE};
+        unless (ClaudeApart::Config::profile($cfg, $pick)) { print STDERR "claude-apart: unknown profile in CLAUDE_APART_PROFILE.\n"; return 6 }
+    } else {
+        if (($ENV{HERDR_ENV} || "") eq "1" && length($ENV{HERDR_WORKSPACE_ID} || "")) {
+            my $label = ClaudeApart::Herdr::workspace_label($ENV{HERDR_WORKSPACE_ID});
+            $pick = ClaudeApart::Herdr::profile_for_label($cfg, $label);
+        }
+        $pick = ClaudeApart::Config::default_profile($cfg) unless defined $pick;
+        unless (defined $pick) { print STDERR "claude-apart: no profile to use (set a default).\n"; return 6 }
+    }
+    print "$pick\n";
+    return 0;
+}
+
+sub cmd_identity_check {
+    my (@a) = @_;
+    return usage() unless @a == 1;
+    my ($st, $email) = ClaudeApart::Identity::check($a[0]);
+    print "$email\n" if length $email;
+    return $st eq "ok" ? 0 : $st eq "missing" ? 3 : 4;
+}
+
 my $cmd = shift @ARGV;
 unless (defined $cmd) { exit usage() }
 my $rc;
 if ($cmd eq 'config') {
     $rc = eval { cmd_config(@ARGV) };
+    if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
+    exit $rc;
+}
+if ($cmd eq "resolve" || $cmd eq "identity-check") {
+    $rc = eval { $cmd eq "resolve" ? cmd_resolve(@ARGV) : cmd_identity_check(@ARGV) };
     if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
     exit $rc;
 }
