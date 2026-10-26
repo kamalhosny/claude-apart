@@ -105,3 +105,15 @@ test_cli_unknown_subcommand() {
   run perl -I"$REPO/lib" "$REPO/libexec/claude-apart/capart.pl" frobnicate
   assert_rc 2 "capart unknown" || return 1
 }
+
+test_ca_home_inside_test_dir() {
+  case "$CA_HOME" in "$T"/*) ;; *) echo "CA_HOME not under T: $CA_HOME"; return 1;; esac
+}
+
+test_cli_through_symlink_finds_root() {
+  ln -s "$REPO/bin/claude-apart" "$T/bin/ca"
+  run env -u CA_ROOT "$T/bin/ca" help
+  assert_rc 0 "help via symlink" || return 1
+  assert_contains "$OUT" "Usage" "usage printed" || return 1
+  [ -z "$(env | grep '^CA_ROOT=')" ] || { echo "CA_ROOT leaked into env"; return 1; }
+}

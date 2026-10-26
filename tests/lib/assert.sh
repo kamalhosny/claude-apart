@@ -1,7 +1,7 @@
 # Shared test helpers. Sourced by tests/run.sh and by test files.
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-export CA_ROOT="$REPO"
 . "$REPO/libexec/claude-apart/lib/common.sh"
+export -n CA_ROOT CA_HOME
 
 t_setup() {
   T=$(mktemp -d "${TMPDIR:-/tmp}/capart.XXXXXX") || return 1
@@ -11,6 +11,7 @@ t_setup() {
   mkdir -p "$HOME" "$T/bin" "$T/prefix"
   export XDG_CONFIG_HOME="$HOME/.config"
   export CLAUDE_APART_HOME="$T/prefix"
+  export CA_HOME="$CLAUDE_APART_HOME"
   export CLAUDE_APART_REAL_CLAUDE="$REPO/tests/fixtures/fake-claude"
   export FAKE_LOG="$T/fake.log"
   export PATH="$T/bin:$REPO/bin:/usr/bin:/bin"
