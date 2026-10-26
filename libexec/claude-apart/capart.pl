@@ -5,7 +5,9 @@
 # hook forks: the child does the work; this parent only waits, with an alarm.
 # At the budget it kills the child and blocks. Any child exit other than 0 or
 # 2 (die, crash, signal) also blocks. A SIGALRM arriving early blocks too.
-# The budget is 5 s; CLAUDE_APART_HOOK_BUDGET may only lower it (tests).
+# The budget is 5 s. CLAUDE_APART_HOOK_BUDGET (tests) may lower it, but it is
+# kept within 0.05..5 s: below 1 µs Time::HiRes::alarm would set no timer at
+# all. A value that is not a plain number is ignored.
 # This alarm is the only one in the hook processes.
 BEGIN {
     if (@ARGV && $ARGV[0] eq 'hook') {
@@ -13,7 +15,9 @@ BEGIN {
         $SIG{ALRM} = $fail;
         my $budget = 5;
         my $want = $ENV{CLAUDE_APART_HOOK_BUDGET};
-        $budget = $want if defined $want && $want =~ /\A[0-9]*\.?[0-9]+\z/ && $want > 0 && $want < $budget;
+        if (defined $want && $want =~ /\A[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\z/) {
+            $budget = $want < 0.05 ? 0.05 : $want > 5 ? 5 : $want + 0;
+        }
         my $pid = fork;
         $fail->() unless defined $pid;
         if ($pid) {

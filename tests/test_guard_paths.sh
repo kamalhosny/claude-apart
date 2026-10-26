@@ -347,6 +347,52 @@ test_cd_position() {
   _allowed "chain of known cd targets" || return 1
 }
 
+test_cd_that_may_not_move() {
+  t_two_profiles
+  mkdir -p "$HOME/repo/sub"
+  echo n > "$HOME/notes.txt"
+  local c
+  for c in 'cd ~/nosuch; cat .claude/x' 'cd ~/notes.txt; cat .claude/x' 'cd /nonexistent; grep -r foo .' \
+           'cd ~/repo/x 2>/dev/null; rg --hidden foo' 'cd ~/repo | grep -r foo .' 'cd ~/repo | cat .claude/x' \
+           'cd ~/repo & cat .claude/x' 'cd ~/repo || cat .claude/x' 'cd ~/repo && true || cat .claude/x' \
+           'false && cd ~/repo; cat .claude/x' 'true || cd ~/repo; cat .claude/x' \
+           '! cd ~/repo && cat .claude/x' 'if cd ~/repo; then :; fi; cat .claude/x' \
+           'f() { cd ~/repo; }; cat .claude/x' 'case x in y) cd ~/repo;; esac; cat .claude/x' \
+           'cd ~/repo && ls & cat .claude/x' 'ls | cd ~/repo; cat .claude/x'; do
+    _sh work "$c" "$HOME"
+    _blocked "cwd home: $c" || return 1
+  done
+  for c in 'if cd ~; then cat .claude/x; fi' '{ cd ~; }; cat .claude/x' 'builtin cd ~; cat .claude/x' \
+           'command cd ~ && cat .claude/x' 'X=1 cd ~ && grep -r foo .'; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "cwd repo: $c" || return 1
+  done
+  mkdir "$HOME/locked"; chmod 000 "$HOME/locked"
+  _sh work 'cd ~/locked; cat .claude/x' "$HOME"
+  chmod 755 "$HOME/locked"
+  _blocked "cd into a folder that cannot be entered" || return 1
+  for c in 'cd ~/repo; cat .claude/x' 'cd ~/repo && cat .claude/x' 'cd ~/repo && cd sub && cat .claude/x' \
+           'builtin cd ~/repo; cat .claude/x' 'cd ~/repo && ls | cat .claude/x' 'cd ~/repo; ls & cat .claude/x' \
+           '(cd ~/nosuch); cd ~/repo; cat .claude/x'; do
+    _sh work "$c" "$HOME"
+    _allowed "cwd home: $c" || return 1
+  done
+}
+
+test_budget_clamped() {
+  t_two_profiles
+  _endless_glob_tree
+  local b
+  for b in 0.0000001 0 1e-9; do
+    CLAUDE_APART_HOOK_BUDGET=$b _bounded_hook 20 work "$(_bash_json 'cat ~/*/*/*/*/*/*/*/zzz')"
+    _guard_error "budget $b is raised to 0.05 s" || return 1
+    [ "$ELAPSED" -lt 3000 ] || { echo "budget $b took ${ELAPSED} ms"; return 1; }
+  done
+  CLAUDE_APART_HOOK_BUDGET=soon _bounded_hook 20 work "$(_bash_json 'cat ~/*/*/*/*/*/*/*/zzz')"
+  _guard_error "a budget that is not a number gives 5 s" || return 1
+  [ "$ELAPSED" -lt 9000 ] || { echo "took ${ELAPSED} ms"; return 1; }
+}
+
 test_other_tools_write_and_ancestor() {
   t_two_profiles
   mkdir -p "$HOME/repo"

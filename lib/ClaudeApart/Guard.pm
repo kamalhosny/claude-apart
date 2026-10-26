@@ -182,13 +182,24 @@ sub _shell {
 # Splits a command into simple commands ("segments": split at ; & && | ||,
 # newlines, ( ) and backticks). Each segment records its words, its redirect
 # targets, the directories it runs in, and whether the shell runs it.
-# Directories: the session cwd; a cd/pushd moves later segments to its target
-# (from each earlier directory); a target that cannot be known (`cd -`,
-# `cd "$UNSET"`) keeps the earlier directories and adds the session cwd; a
-# subshell or $(…) gives the directories back when it closes. A quoted word
-# that holds shell code (bash -c "…", "$(…)") is analysed one level deeper;
-# its segments count as run only for $(…) and backticks.
+# A quoted word that holds shell code (bash -c "…", "$(…)") is analysed one
+# level deeper; its segments count as run only for $(…) and backticks.
 # Each word item is {w => text, sp => [spellings of its path pieces]}.
+#
+# Directories start as the session cwd. A cd/pushd/popd changes them for
+# later segments, and the change only replaces the old directories when the
+# cd surely ran and surely worked:
+# - the target is written out and is a directory we can enter from every
+#   current directory ("known"); otherwise the old directories stay too
+#   (an unwritten target such as `cd "$X"`, `cd -`, popd adds the session cwd);
+# - the cd is first in its and-or list, or follows && and is followed by &&;
+#   no keyword in front of it (if, while, !, {, then, do, …), and no
+#   unmatched ")" (a case pattern) before it;
+# - a cd right before | or & runs in a subshell: nothing changes;
+# - after ||, the segments see every directory the list has seen;
+# - when a list with a doubtful cd ends, it keeps every directory it has seen;
+#   a list sent to the background (&) gives back the directories it started with;
+# - a subshell, $(…) or backticks give the directories back when they close.
 sub _analyse {
     my ($ctx, $cmd) = @_;
     my $sh = { text => $cmd, segments => [] };
@@ -200,16 +211,38 @@ sub _analyse {
 
 sub _walk {
     my ($ctx, $sh, $text, $dirs, $depth, $exec) = @_;
-    my (@stack, $in_tick);
+    my (@stack, $in_tick, $list, $odd_paren);
     my ($words, $redirs, $want_target) = ([], [], 0);
-    my $end = sub {
-        return unless @$words || @$redirs;
-        my $seg = { dirs => $dirs, exec => $exec, words => [], redirects => [] };
-        push @{ $seg->{words} }, _item($ctx, $sh, $_, $dirs, $depth, $exec) for @$words;
-        push @{ $seg->{redirects} }, _item($ctx, $sh, $_, $dirs, $depth, $exec) for @$redirs;
-        push @{ $sh->{segments} }, $seg;
-        $dirs = _cd($ctx, $seg, $dirs);
-        ($words, $redirs) = ([], []);
+    my $new_list = sub { $list = { start => $dirs, seen => [@$dirs], prev => '', doubt => 0 } };
+    $new_list->();
+    my $end = sub {    # end the segment; $op: the operator after it
+        my ($op) = @_;
+        if (@$words || @$redirs) {
+            my $seg = { dirs => $dirs, exec => $exec, words => [], redirects => [] };
+            push @{ $seg->{words} }, _item($ctx, $sh, $_, $dirs, $depth, $exec) for @$words;
+            push @{ $seg->{redirects} }, _item($ctx, $sh, $_, $dirs, $depth, $exec) for @$redirs;
+            push @{ $sh->{segments} }, $seg;
+            my $cd = _cd($ctx, $seg, $dirs);
+            $dirs = _after_cd($cd, $dirs, $list, $op, $odd_paren) if $cd;
+            ($words, $redirs) = ([], []);
+        }
+        $list->{seen} = [ ClaudeApart::Paths::uniq(@{ $list->{seen} }, @$dirs) ];
+        die "too many cd directories\n" if @{ $list->{seen} } > $MAX_DIRS;
+        $dirs = $list->{seen} if $op eq '||';
+        $list->{prev} = $op;
+    };
+    my $end_list = sub {    # ; newline & and the end of the text
+        my ($op) = @_;
+        $end->($op);
+        if ($op eq '&') { $dirs = $list->{start} }
+        elsif ($list->{doubt}) { $dirs = $list->{seen} }
+        $new_list->();
+    };
+    my $open = sub { $end->('') if @$words || @$redirs; push @stack, [ $dirs, $list ]; $new_list->() };
+    my $close = sub {
+        $end_list->(';');
+        if (@stack) { ($dirs, $list) = @{ pop @stack } }
+        else { $odd_paren = 1 }
     };
     for my $t (ClaudeApart::Paths::shell_words($text)) {
         my ($w, $op) = @$t;
@@ -220,20 +253,21 @@ sub _walk {
         (my $rest = $w) =~ s/&?[<>]+[&|]?//g;
         my $redirect = $rest ne $w;
         if (length $rest) {
-            $end->();
             $want_target = 0;
-            for my $ch (split //, $rest) {
-                if ($ch eq '(') { push @stack, $dirs }
-                elsif ($ch eq ')') { $dirs = pop @stack if @stack }
-                elsif ($ch eq '`') {
-                    if ($in_tick) { $dirs = pop @stack if @stack; $in_tick = 0 }
-                    else { push @stack, $dirs; $in_tick = 1 }
-                }
+            while ($rest =~ /\G(&&|\|\||\|&?|;+&?|[&()`\n])/gc) {
+                my $c = $1;
+                if ($c eq '&&' || $c eq '||') { $end->($c) }
+                elsif (substr($c, 0, 1) eq '|') { $end->('|') }
+                elsif ($c eq '&') { $end_list->('&') }
+                elsif ($c eq '(') { $open->() }
+                elsif ($c eq ')') { $close->() }
+                elsif ($c eq '`') { if ($in_tick) { $close->(); $in_tick = 0 } else { $open->(); $in_tick = 1 } }
+                else { $end_list->(';') }
             }
         }
         $want_target = 1 if $redirect && $w !~ /\(/;
     }
-    $end->();
+    $end_list->(';');
 }
 
 sub _item {
@@ -246,21 +280,49 @@ sub _item {
     return { w => $w, sp => [ ClaudeApart::Paths::uniq(@sp) ] };
 }
 
+my %COND_WORD = map { $_ => 1 } qw(if then else elif while until do ! {);
+
+# A cd/pushd/popd segment: undef for any other segment, else
+# {dirs => where it may go, known => it surely gets there if it runs,
+#  doubt => a keyword in front makes it conditional}.
 sub _cd {
     my ($ctx, $seg, $dirs) = @_;
     my @w = map { $_->{w} } @{ $seg->{words} };
-    shift @w while @w && $w[0] =~ /\A[A-Za-z_][A-Za-z0-9_]*=/;
-    return $dirs unless @w && $w[0] =~ /\A(?:cd|pushd|popd)\z/;
+    my $doubt = 0;
+    while (@w) {
+        if ($w[0] =~ /\A[A-Za-z_][A-Za-z0-9_]*=/ || $w[0] eq 'builtin' || $w[0] eq 'command') { shift @w }
+        elsif ($COND_WORD{ $w[0] }) { shift @w; $doubt = 1 }
+        else { last }
+    }
+    return undef unless @w && $w[0] =~ /\A(?:cd|pushd|popd)\z/;
     my $cmd = shift @w;
     shift @w while @w && $w[0] =~ /\A-./;
-    my $t = @w ? $w[0] : '~';
-    my @new;
-    if ($cmd eq 'popd' || !_known_dir($t, $dirs)) {
+    my $t = @w ? $w[0] : $cmd eq 'cd' ? '~' : undef;    # pushd alone swaps: unknown
+    my ($known, @new) = (0);
+    if ($cmd eq 'popd' || !defined $t || !_known_dir($t, $dirs)) {
         @new = (@$dirs, $ctx->{cwd});
     } else {
-        @new = map { ClaudeApart::Paths::spellings($t, $_) } @$dirs;
+        $known = 1;
+        for my $d (@$dirs) {
+            my @s = ClaudeApart::Paths::spellings($t, $d);
+            $known = 0 unless grep { -d $_ && -x _ } @s;
+            push @new, @s;
+        }
     }
     @new = ClaudeApart::Paths::uniq(@new);
+    die "too many cd directories\n" if @new > $MAX_DIRS;
+    return { dirs => \@new, known => $known, doubt => $doubt };
+}
+
+# The directories after a cd segment, given the operator after it.
+sub _after_cd {
+    my ($cd, $old, $list, $op, $odd_paren) = @_;
+    return $old if $op eq '|' || $op eq '&';           # ran in a subshell
+    my $prev = $list->{prev};
+    my $sure = $cd->{known} && !$cd->{doubt} && !$odd_paren && $op ne '||'
+        && ($prev eq '' || ($prev eq '&&' && $op eq '&&'));
+    $list->{doubt} = 1 if $prev ne '' || $cd->{doubt} || $odd_paren;
+    my @new = $sure ? @{ $cd->{dirs} } : ClaudeApart::Paths::uniq(@$old, @{ $cd->{dirs} });
     die "too many cd directories\n" if @new > $MAX_DIRS;
     return \@new;
 }
