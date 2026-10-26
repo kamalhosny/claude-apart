@@ -140,7 +140,7 @@ test_mcp_and_webfetch_strings() {
   _tool work WebFetch url 'https://example.com/docs'
   _allowed "plain url" || return 1
   _tool personal mcp__fs__read path '~/.claude-work/x'
-  _allowed "personal mcp reads work (granted)" || return 1
+  _blocked "personal mcp on work: an MCP tool may write (R25)" || return 1
 }
 
 test_fail_closed() {
@@ -177,15 +177,246 @@ test_fail_closed_bad_calls() {
   _guard_error "empty stdin" || return 1
 }
 
+_ms() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
+
+_bounded_hook() { # <secs> <profile> <json>: the hook, hard-killed (whole group) after <secs>; sets ELAPSED
+  local t0; t0=$(_ms)
+  run perl -e 'my $s = shift; my $pid = fork; if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
+    $SIG{ALRM} = sub { kill "KILL", -$pid; exit 124 }; alarm $s; waitpid $pid, 0;
+    exit(($? & 127) ? 128 + ($? & 127) : $? >> 8)' "$1" \
+    perl -I"$REPO/lib" "$REPO/libexec/claude-apart/capart.pl" hook pre-tool --profile "$2" <<<"$3"
+  ELAPSED=$(( $(_ms) - t0 ))
+}
+
+_endless_glob_tree() { # ~/g holds 30 links to itself: ~/*/*/*/*/*/*/*/zzz never ends
+  local i
+  mkdir -p "$HOME/g"
+  for i in $(seq 1 30); do ln -s . "$HOME/g/l$i"; done
+}
+
+_bash_json() { # <command> [cwd]
+  perl -MJSON::PP -e 'print JSON::PP->new->encode({cwd => $ARGV[1], tool_name => "Bash", tool_input => {command => $ARGV[0]}})' "$1" "${2:-$HOME}"
+}
+
 test_hook_time_budget() {
   t_two_profiles
   local big json
   big=$(perl -e 'print join(" ", map { "w$_ a/b" } 1..8000)')
   json=$(perl -MJSON::PP -e 'print encode_json({cwd => $ENV{HOME}, tool_name => "mcp__x__y", tool_input => {text => $ARGV[0]}})' "$big")
-  run perl -I"$REPO/lib" -MClaudeApart::Hooks -e '$ClaudeApart::Hooks::BUDGET = 0.05; exit ClaudeApart::Hooks::main(@ARGV)' pre-tool --profile work <<<"$json"
-  _guard_error "over the time budget" || return 1
-  run perl -I"$REPO/lib" -MClaudeApart::Hooks -e 'exit ClaudeApart::Hooks::main(@ARGV)' pre-tool --profile work <<<"$json"
+  CLAUDE_APART_HOOK_BUDGET=0.05 _bounded_hook 20 work "$json"
+  _guard_error "over a lowered budget" || return 1
+  _bounded_hook 20 work "$json"
   _allowed "same input within the normal budget" || return 1
+}
+
+test_watchdog_stops_long_glob() {
+  t_two_profiles
+  _endless_glob_tree
+  CLAUDE_APART_HOOK_BUDGET=0.5 _bounded_hook 20 work "$(_bash_json 'cat ~/*/*/*/*/*/*/*/zzz')"
+  _guard_error "endless glob, budget 0.5 s" || return 1
+  [ "$ELAPSED" -lt 4000 ] || { echo "took ${ELAPSED} ms: the glob was not interrupted"; return 1; }
+  CLAUDE_APART_HOOK_BUDGET=999 _bounded_hook 20 work "$(_bash_json 'cat ~/*/*/*/*/*/*/*/zzz')"
+  _guard_error "endless glob, a budget above 5 s is ignored" || return 1
+  [ "$ELAPSED" -lt 9000 ] || { echo "took ${ELAPSED} ms: the 5 s budget did not hold"; return 1; }
+}
+
+test_text_check_before_disk() {
+  t_two_profiles
+  _endless_glob_tree
+  _bounded_hook 20 work "$(_bash_json 'cat ~/.claude/x ~/*/*/*/*/*/*/*/zzz')"
+  _blocked "a mention blocks before the glob runs" || return 1
+  [ "$ELAPSED" -lt 3000 ] || { echo "took ${ELAPSED} ms"; return 1; }
+}
+
+test_firmlink_spelling() {
+  t_two_profiles
+  ln "$HOME/.claude.json" "$T/hardlink.json"
+  _tool work Read file_path "$T/hardlink.json"
+  _blocked "same inode as the personal identity file" || return 1
+  local d=/System/Volumes/Data
+  [ -d "$d$HOME" ] || return 0                       # macOS only
+  _tool work Read file_path "$d$HOME/.claude/x"
+  _blocked "Read, firmlink spelling" || return 1
+  pre_tool work Grep "{\"pattern\":\"x\",\"path\":$(_json_str "$d$HOME")}" "$HOME/repo"
+  _blocked "Grep on home, firmlink spelling" || return 1
+  _sh work "grep -r secret $d$T" "$HOME/repo"
+  _blocked "grep -r on a parent of home, firmlink spelling" || return 1
+  _sh work "cat $d$HOME/.claude/x"
+  _blocked "Bash, firmlink spelling" || return 1
+  _tool work mcp__fs__read path "$d$HOME/.claude/x"
+  _blocked "MCP, firmlink spelling" || return 1
+  _tool work Read file_path "$d$HOME/.claude-work/x"
+  _allowed "own dir, firmlink spelling" || return 1
+}
+
+test_claude_json_family() {
+  t_two_profiles
+  _tool work Read file_path "$HOME/.claude.json.backup"
+  _blocked "work reads the identity backup" || return 1
+  _sh work 'cat ~/.claude.json.tmp.1.2'
+  _blocked "work cats an identity temp copy" || return 1
+  _tool work Grep "{\"pattern\":\"x\",\"path\":$(_json_str "$HOME/.claude.json.backup")}"
+  _blocked "work greps the identity backup" || return 1
+  _sh work 'cat ~/.claude.jsonx'
+  _allowed "another name is not in the family" || return 1
+  _tool personal Read file_path "$HOME/.claude.json.backup"
+  _allowed "personal reads its own backup" || return 1
+  _sh personal 'cat ~/.claude.json.tmp.1.2'
+  _allowed "personal cats its own temp copy" || return 1
+}
+
+test_case_insensitive_on_macos() {
+  t_two_profiles
+  [ "$(uname -s)" = Darwin ] || return 0
+  _sh work 'cat ~/.CLAUDE/x'
+  _blocked "upper case" || return 1
+  echo s > "$HOME/.claude/settings.json"
+  _tool work Read file_path "$HOME/.Claude/settings.json"
+  _blocked "mixed case, Read" || return 1
+  _tool work Read file_path "$HOME/.CLAUDE.JSON.BACKUP"
+  _blocked "identity family in upper case" || return 1
+  _sh work 'cat ~/.Claude-work/x'
+  _allowed "own dir in other case is not the personal dir" || return 1
+  _paths 'print ClaudeApart::Paths::mentions($ARGV[0], "$ENV{HOME}/.claude", "/") ? "yes" : "no"' '~/.Claude-work/x'
+  assert_eq no "$OUT" "~/.Claude-work does not mention ~/.claude" || return 1
+}
+
+test_recursive_reader_in_cwd() {
+  t_two_profiles
+  mkdir -p "$HOME/repo" "$HOME/src"
+  local c
+  for c in 'rg --hidden foo' 'grep -r foo' 'rg -t py foo' 'tree' 'du -sh' 'find -name x' 'grep -rn -A 3 foo'; do
+    _sh work "$c" "$HOME"
+    _blocked "cwd home: $c" || return 1
+  done
+  _sh work 'cd ~ && rg foo' "$HOME/repo"
+  _blocked "cd home, then rg" || return 1
+  _sh work 'rg --hidden foo' "$HOME/repo"
+  _allowed "rg in a repo" || return 1
+  _sh work 'grep -rn foo src' "$HOME"
+  _allowed "grep -r on an existing folder below home" || return 1
+  for c in "find ~/repo -name '*.md'" "find src -path '*/x/*' -o -iname 'a*'" "grep -rn 'foo.*bar' src" \
+           "rg -g '*.md' foo src" "grep -r --include='*.py' foo src"; do
+    _sh work "$c" "$HOME"
+    _allowed "cwd home, a name pattern is not a path: $c" || return 1
+  done
+  for c in 'grep -r foo *' 'rg foo *'; do
+    _sh work "$c" "$HOME"
+    _blocked "cwd home: $c (dotglob may reach the personal dir)" || return 1
+  done
+  for c in 'grep -r foo .*' 'grep -r foo ../.?' 'rg foo ./..*'; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "a dot glob matches ..: $c" || return 1
+  done
+}
+
+test_more_recursive_readers() {
+  t_two_profiles
+  mkdir -p "$HOME/repo" "$T/deep/a/b"
+  local c
+  for c in 'grep -d recurse foo ~' 'grep --directories=recurse foo ~' 'grep --directories recurse foo ~' \
+           'ugrep foo ~'; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "work: $c" || return 1
+  done
+  _sh work 'grep -d skip foo ~' "$HOME/repo"
+  _allowed "grep -d skip is not recursive" || return 1
+  ln -s "$T/deep/a/b" "$HOME/repo/l"
+  pre_tool work Glob "{\"pattern\":\"../../.claude/*.md\",\"path\":$(_json_str "$HOME/repo/l")}" "$HOME/repo"
+  _blocked "Glob base uses every spelling of path" || return 1
+}
+
+test_cd_position() {
+  t_two_profiles
+  mkdir -p "$HOME/repo/sub"
+  _sh work 'cd ~/repo && grep -rn foo .' "$HOME"
+  _allowed "grep -r . after cd into a repo" || return 1
+  _sh work 'cd repo && find . -name x' "$HOME"
+  _allowed "find . after cd into a repo" || return 1
+  _sh work 'cd ~/repo; cat .claude/x' "$HOME"
+  _allowed "relative path after cd is not from the old cwd" || return 1
+  _sh work 'cd ~ && cat .claude/x' "$HOME/repo"
+  _blocked "cd home, then a relative path" || return 1
+  _sh work '(cd ~/repo && ls); grep -r foo .' "$HOME"
+  _blocked "a subshell gives the cwd back" || return 1
+  _sh work 'cd ~/repo && cd "$CA_UNSET_DIR" && cat .claude/x' "$HOME"
+  _blocked "unknown cd target: the session cwd is checked too" || return 1
+  _sh work 'cd - && cat .claude/x' "$HOME"
+  _blocked "cd -: the session cwd is checked too" || return 1
+  _sh work 'cd ~/repo && cd sub && cat .claude/x' "$HOME"
+  _allowed "chain of known cd targets" || return 1
+}
+
+test_other_tools_write_and_ancestor() {
+  t_two_profiles
+  mkdir -p "$HOME/repo"
+  pre_tool personal mcp__fs__write_file '{"path":"~/.claude-work/x","content":"hi"}'
+  _blocked "personal MCP write into work" || return 1
+  pre_tool work mcp__fs__search '{"path":"~","pattern":"x"}'
+  _blocked "MCP search on home" || return 1
+  pre_tool work mcp__fs__search '{"paths":["/tmp","~"]}'
+  _blocked "MCP paths list holds home" || return 1
+  pre_tool work mcp__fs__search "{\"Path\":$(_json_str "file://$T")}"
+  _blocked "MCP path key in other case, file:// parent of home" || return 1
+  pre_tool work mcp__notes__add '{"text":"see / for details"}'
+  _allowed "a slash in plain text" || return 1
+  pre_tool work mcp__fs__search '{"directory":"~/repo"}'
+  _allowed "MCP search in a repo" || return 1
+  pre_tool work mcp__fs__search '{"path":"*","pattern":"x"}'
+  _blocked "MCP glob path searches its folder (home)" || return 1
+  pre_tool work mcp__fs__search '{"path":"repo/*.md"}'
+  _allowed "MCP glob path in a repo" || return 1
+}
+
+test_granted_read_only_allowlist() {
+  t_two_profiles
+  local c
+  for c in 'cat ~/.claude-work/x | grep a | sort' 'ls ~/.claude-work 2>/dev/null' \
+           "find ~/.claude-work -name '*.md'" 'echo "rm ~/.claude-work/x"' \
+           'cd ~/.claude-work && cat x | wc -l' '/bin/cat ~/.claude-work/x' 'TZ=UTC cat ~/.claude-work/x' \
+           'cat ~/.claude-work/x > /tmp/y' 'sort ~/.claude-work/x | uniq -c' 'LC_ALL=C sort ~/.claude-work/x'; do
+    _sh personal "$c"
+    _allowed "personal: $c" || return 1
+  done
+  for c in 'perl -0pi -e s/a/b/ ~/.claude-work/x' 'perl -0777pi -e s/a/b/ ~/.claude-work/x' \
+           'git -C ~/.claude-work log' 'ls ~/.claude-work | xargs rm' 'find ~/.claude-work -delete' \
+           'find ~/.claude-work -exec cat {} \;' 'cat ~/.claude-work/a > ~/.claude-work/b' \
+           'sort -o ~/.claude-work/b ~/.claude-work/a' 'uniq ~/.claude-work/a ~/.claude-work/b' \
+           'tar -xf /tmp/x.tar -C ~/.claude-work' "python3 -c \"open('$HOME/.claude-work/x','w')\"" \
+           'cat "$(rm ~/.claude-work/x)"' './cat ~/.claude-work/x' 'tree ~/.claude-work -o ~/.claude-work/t' \
+           'git status && cat ~/.claude-work/x' 'awk 1 ~/.claude-work/x' 'PATH=/tmp cat ~/.claude-work/x' \
+           'LESSOPEN="|rm %s" less ~/.claude-work/x' 'tree -R ~/.claude-work' \
+           'cd ~/.claude-work && file -C -m x' 'cat <(rm ~/.claude-work/x)'; do
+    _sh personal "$c"
+    _blocked "personal: $c" || return 1
+  done
+}
+
+test_recursive_modifiers() {
+  t_two_profiles
+  mkdir -p "$HOME/repo"
+  local c
+  for c in 'rm -rf ~/' 'chmod -R 000 ~' 'rm -r ~' 'chown -R me ~' 'xattr -rc ~' 'find ~ -delete' \
+           'ditto ~ /tmp/x' 'rm -rf ..' 'cd ~ && rm -rf .*'; do
+    _sh personal "$c" "$HOME/repo"
+    _blocked "personal: $c" || return 1
+  done
+  _sh personal 'find . -delete' "$HOME"
+  _blocked "find -delete with no path, cwd home" || return 1
+  _sh work 'rm -rf ~'
+  _blocked "work: rm -rf ~" || return 1
+  for c in 'rm -rf ~/repo/build' 'chmod -R 755 ~/repo' 'rm ~/notes.txt' 'find ~/repo -delete'; do
+    _sh personal "$c" "$HOME/repo"
+    _allowed "personal: $c" || return 1
+  done
+  for c in "find ~/repo -name '*.tmp' -delete" 'rm -rf *.o' "find ~/repo -iname 'x*' -exec rm {} +"; do
+    _sh personal "$c" "$HOME"
+    _allowed "personal, cwd home: $c" || return 1
+  done
+  _sh personal 'chmod -R 000 .*' "$HOME/repo"
+  _blocked "a dot glob matches .." || return 1
+  _sh personal "find ~/repo -name x -exec rm -rf ~ \;" "$HOME/repo"
+  _blocked "rm -rf ~ inside find -exec" || return 1
 }
 
 test_mentions_boundary() {
@@ -448,12 +679,12 @@ test_write_constructs() {
            'rm -rf ~/.claude-work/x' 'ln -s a ~/.claude-work/l' 'touch ~/.claude-work/x' \
            'mkdir ~/.claude-work/d' 'perl -pi -e s/a/b/ ~/.claude-work/x' 'chmod 600 ~/.claude-work/x' \
            'cd ~/.claude-work && touch x' 'rsync -a src/ ~/.claude-work/' 'install -m 644 a ~/.claude-work/a' \
-           'dd if=a of=~/.claude-work/b' 'truncate -s 0 ~/.claude-work/x' 'sed -Ei s/a/b/ ~/.claude-work/x'; do
+           'dd if=a of=~/.claude-work/b' 'truncate -s 0 ~/.claude-work/x' 'sed -Ei s/a/b/ ~/.claude-work/x' \
+           'sed -n 1p ~/.claude-work/x'; do
     _sh personal "$c"
     _blocked "personal: $c" || return 1
   done
-  for c in 'cat ~/.claude-work/x | grep y' 'ls -la ~/.claude-work' 'head ~/.claude-work/x' \
-           'sed -n 1p ~/.claude-work/x'; do
+  for c in 'cat ~/.claude-work/x | grep y' 'ls -la ~/.claude-work' 'head ~/.claude-work/x'; do
     _sh personal "$c"
     _allowed "personal: $c" || return 1
   done

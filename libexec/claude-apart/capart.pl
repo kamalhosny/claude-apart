@@ -1,4 +1,35 @@
 #!/usr/bin/env perl
+# Hook supervisor. This runs first, before anything else is compiled.
+# Claude Code treats a hook that times out (or exits with any code but 2) as
+# ALLOW, and Perl delays signals while a long C call (a big glob) runs, so the
+# hook forks: the child does the work; this parent only waits, with an alarm.
+# At the budget it kills the child and blocks. Any child exit other than 0 or
+# 2 (die, crash, signal) also blocks. A SIGALRM arriving early blocks too.
+# The budget is 5 s; CLAUDE_APART_HOOK_BUDGET may only lower it (tests).
+# This alarm is the only one in the hook processes.
+BEGIN {
+    if (@ARGV && $ARGV[0] eq 'hook') {
+        my $fail = sub { syswrite STDERR, "claude-apart: guard error \xe2\x80\x94 blocked to be safe.\n"; CORE::exit(2) };
+        $SIG{ALRM} = $fail;
+        my $budget = 5;
+        my $want = $ENV{CLAUDE_APART_HOOK_BUDGET};
+        $budget = $want if defined $want && $want =~ /\A[0-9]*\.?[0-9]+\z/ && $want > 0 && $want < $budget;
+        my $pid = fork;
+        $fail->() unless defined $pid;
+        if ($pid) {
+            require Time::HiRes;
+            $SIG{ALRM} = sub { kill 'KILL', $pid; $fail->() };
+            Time::HiRes::alarm($budget);
+            my $got = waitpid($pid, 0);
+            my $st = $?;
+            Time::HiRes::alarm(0);
+            $fail->() unless $got == $pid;
+            my $code = ($st & 127) ? -1 : ($st >> 8);
+            CORE::exit($code) if $code == 0 || $code == 2;
+            $fail->();
+        }
+    }
+}
 use strict;
 use warnings;
 use FindBin ();

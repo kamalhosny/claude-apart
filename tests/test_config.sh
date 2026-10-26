@@ -60,6 +60,7 @@ test_config_foreign_paths() {
   local rd; rd=$(printf '%s\n' "$OUT" | grep '^R:')
   assert_contains "$rd" "R:$HOME/.claude"$'\n' "work reads personal dir denied" || return 1
   assert_contains "$rd" "R:$HOME/.claude.json" "identity file denied" || return 1
+  assert_contains "$rd" "R:$HOME/.claude.json.*" "identity file family denied" || return 1
   assert_contains "$rd" "R:$XDG_CONFIG_HOME/claude-apart" "config dir denied" || return 1
   assert_not_contains "$rd" "$HOME/.claude-work" "own dir not denied" || return 1
   run perl -I"$REPO/lib" -e "$code" personal

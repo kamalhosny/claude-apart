@@ -115,11 +115,15 @@ sub default_profile {
     return (defined $cfg->{default} && length $cfg->{default}) ? $cfg->{default} : undef;
 }
 
+# Absolute paths a profile owns. An entry ending in ".*" names a family: the
+# path without ".*" plus every sibling "<that path>.<anything>". The adopted
+# profile owns the whole ~/.claude.json family, because Claude Code keeps
+# copies of the identity file next to it (.backup, .tmp.<pid>.<hex>).
 sub owned_paths {
     my ($cfg, $name) = @_;
     my $p = profile($cfg, $name) or die "unknown profile: $name\n";
     my @o = ($p->{abs_dir});
-    push @o, "$ENV{HOME}/.claude.json" if $p->{adopted};
+    push @o, "$ENV{HOME}/.claude.json", "$ENV{HOME}/.claude.json.*" if $p->{adopted};
     push @o, @{ $p->{protect} };
     return @o;
 }

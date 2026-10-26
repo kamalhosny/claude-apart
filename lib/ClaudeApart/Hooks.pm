@@ -2,21 +2,17 @@ package ClaudeApart::Hooks;
 use strict;
 use warnings;
 use JSON::PP ();
-use Time::HiRes ();
 use ClaudeApart::Config;
 use ClaudeApart::Guard;
 
 # Entry points for `capart.pl hook <event> --profile NAME`.
 # Exit 2 blocks (Claude Code treats every other code as allow), so every
 # failure becomes exit 2 with the fixed guard error text. Block messages are
-# fixed text: never a path, a profile name or an email.
+# fixed text: never a path, a profile name or an email. The time budget is
+# enforced by the supervisor process in capart.pl.
 
 our $BLOCK_TEXT = "claude-apart: blocked \xe2\x80\x94 this touches another profile.";
 our $ERROR_TEXT = "claude-apart: guard error \xe2\x80\x94 blocked to be safe.";
-
-# Claude Code treats a hook that times out (10 s) as allow, so a hook that
-# runs too long (huge input) stops itself and blocks.
-our $BUDGET = 5;
 
 # Each handler gets the profile name and returns undef (allow) or the text
 # to print on stderr with exit 2.
@@ -27,8 +23,6 @@ sub main {
     my $msg;
     my $ok = eval {
         local $SIG{__WARN__} = sub { die "warning: $_[0]" };
-        local $SIG{ALRM} = sub { die "guard timeout\n" };
-        Time::HiRes::alarm($BUDGET);
         my $event = shift @argv;
         die "no hook event\n" unless defined $event && $EVENT{$event};
         my $profile;
@@ -39,10 +33,8 @@ sub main {
         }
         die "no profile\n" unless defined $profile && length $profile;
         $msg = $EVENT{$event}->($profile);
-        Time::HiRes::alarm(0);
         1;
     };
-    Time::HiRes::alarm(0);
     unless ($ok) { print STDERR "$ERROR_TEXT\n"; return 2 }
     return 0 unless defined $msg;
     print STDERR "$msg\n";
