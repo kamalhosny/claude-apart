@@ -1,0 +1,26 @@
+#!/bin/bash
+# claude-apart: run several Claude Code accounts side by side.
+if [ -z "${CA_ROOT:-}" ]; then
+  _self=$0
+  while [ -L "$_self" ]; do
+    _d=$(cd "$(dirname "$_self")" && pwd)
+    _self=$(readlink "$_self")
+    case "$_self" in /*) ;; *) _self="$_d/$_self";; esac
+  done
+  CA_ROOT=$(cd "$(dirname "$_self")/.." && pwd)
+fi
+. "$CA_ROOT/libexec/claude-apart/lib/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: claude-apart <command>
+
+Run several Claude Code accounts side by side.
+Run claude-apart help for this text.
+USAGE
+}
+
+case "${1:-}" in
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
