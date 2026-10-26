@@ -183,3 +183,42 @@ test_install_links() {
   [ -f "$b/claude-apart" ] && [ ! -L "$b/claude-apart" ] || { echo "claude-apart touched"; return 1; }
   assert_eq "/usr/bin/true" "$(readlink "$b/claude-x")" "foreign link untouched" || return 1
 }
+
+test_identity_incomplete_profile_refuses() {
+  t_two_profiles
+  perl -0pi -e 's/org = org-w\n//' "$XDG_CONFIG_HOME/claude-apart/config"
+  run claude
+  [ "$RC" != 0 ] || { echo "expected refusal (no org)"; return 1; }
+  assert_eq "" "$(_log)" "nothing logged" || return 1
+  perl -0pi -e 's/email = w\@example.com\n//' "$XDG_CONFIG_HOME/claude-apart/config"
+  run claude
+  [ "$RC" != 0 ] || { echo "expected refusal (no email, no org)"; return 1; }
+  assert_contains "$ERR" "claude-apart login work" "fixed text" || return 1
+  assert_eq "" "$(_log)" "nothing logged" || return 1
+}
+
+test_inside_session_stale_profile_env_refuses() {
+  t_two_profiles
+  CLAUDE_CODE_CHILD_SESSION=1 CLAUDE_APART_PROFILE=work run claude hi
+  [ "$RC" != 0 ] || { echo "expected refusal"; return 1; }
+  assert_eq "" "$(_log)" "nothing logged" || return 1
+  CLAUDE_CODE_CHILD_SESSION=1 CLAUDE_APART_PROFILE=work CLAUDE_CONFIG_DIR="$HOME/.claude-work" run claude hi
+  assert_rc 0 "matching env" || return 1
+  assert_contains "$(_log)" "PROFILE=work" "work" || return 1
+}
+
+test_oauth_token_refused() {
+  t_two_profiles
+  CLAUDE_CODE_OAUTH_TOKEN=x run claude
+  [ "$RC" != 0 ] || { echo "expected refusal"; return 1; }
+  assert_eq "" "$(_log)" "nothing logged" || return 1
+  CLAUDE_CODE_OAUTH_TOKEN=x run claude --allow-api-key
+  assert_rc 0 "override" || return 1
+}
+
+test_caller_ca_vars_do_not_leak() {
+  t_two_profiles
+  CA_ADOPTED=1 CA_DIR=/nowhere run claude-work
+  assert_rc 0 "claude-work" || return 1
+  assert_contains "$(_log)" "CONFIG_DIR=$HOME/.claude-work" "own values used" || return 1
+}

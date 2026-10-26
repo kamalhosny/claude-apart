@@ -14,7 +14,7 @@ for a in "$@"; do
   if [ "$a" = --allow-api-key ]; then allow_key=1; else args[${#args[@]}]=$a; fi
 done
 
-if [ "$allow_key" = 0 ] && { [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; }; then
+if [ "$allow_key" = 0 ] && { [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; }; then
   echo "claude-apart: an API key is set; it would bypass the profile login. Unset it, or pass --allow-api-key." >&2
   exit 1
 fi
@@ -26,7 +26,9 @@ case "$self" in
   *)        echo "claude-apart: unknown launcher name." >&2; exit 1 ;;
 esac
 
-eval "$(capart config shell "$profile")" || exit 1
+unset CA_NAME CA_DIR CA_ADOPTED CA_TAG CA_EMOJI CA_COLOUR CA_EMAIL CA_ORG CA_CAN_READ CA_THEME
+shellvars=$(capart config shell "$profile") || exit 1
+eval "$shellvars"
 
 case "${args[0]:-}" in
   -v|--version|-h|--help) ;;

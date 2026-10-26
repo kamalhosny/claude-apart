@@ -59,9 +59,14 @@ sub cmd_config {
 sub session_profile {
     my ($cfg) = @_;
     my $env = $ENV{CLAUDE_APART_PROFILE};
-    if (defined $env && length $env) {
-        return ClaudeApart::Config::profile($cfg, $env) ? $env : undef;
-    }
+    my $own = session_dir_profile($cfg);
+    return undef unless defined $own;
+    return undef if defined $env && length $env && $env ne $own;
+    return $own;
+}
+
+sub session_dir_profile {
+    my ($cfg) = @_;
     my $cd = $ENV{CLAUDE_CONFIG_DIR};
     if (defined $cd && length $cd) {
         $cd =~ s{(?<=.)/+\z}{};

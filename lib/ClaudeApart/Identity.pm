@@ -33,6 +33,7 @@ sub read {
 sub check {
     my ($name) = @_;
     my $p = ClaudeApart::Config::profile(_cfg(), $name) or die "unknown profile: $name\n";
+    return ('missing', '') unless length $p->{email} && length $p->{org};
     my $id = ClaudeApart::Identity::read($name) or return ('missing', '');
     return ('mismatch', $id->{email}) if length $p->{email} && lc $id->{email} ne lc $p->{email};
     return ('mismatch', $id->{email}) if length $p->{org} && $id->{org} ne $p->{org};
