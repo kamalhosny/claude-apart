@@ -128,6 +128,12 @@ sub cmd_identity_check {
 
 my $cmd = shift @ARGV;
 unless (defined $cmd) { exit usage() }
+if ($cmd eq 'hook') {
+    # Hooks fail closed: anything that goes wrong, even loading the code, blocks.
+    my $hrc = eval { require ClaudeApart::Hooks; ClaudeApart::Hooks::main(@ARGV) };
+    unless (defined $hrc) { print STDERR "claude-apart: guard error \xe2\x80\x94 blocked to be safe.\n"; exit 2 }
+    exit $hrc;
+}
 my $rc;
 if ($cmd eq 'config') {
     $rc = eval { cmd_config(@ARGV) };

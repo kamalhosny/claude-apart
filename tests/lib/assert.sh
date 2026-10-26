@@ -84,10 +84,11 @@ hook() { # <profile> <event> <json>
 _json_str() {
   local s=$1
   s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}; s=${s//$'\r'/\\r}
   printf '"%s"' "$s"
 }
 
 pre_tool() { # <profile> <tool> <tool_input_json> [cwd]
   local cwd=${4:-$HOME}
-  hook "$1" PreToolUse "{\"hook_event_name\":\"PreToolUse\",\"cwd\":$(_json_str "$cwd"),\"tool_name\":$(_json_str "$2"),\"tool_input\":$3}"
+  hook "$1" pre-tool "{\"hook_event_name\":\"PreToolUse\",\"cwd\":$(_json_str "$cwd"),\"tool_name\":$(_json_str "$2"),\"tool_input\":$3}"
 }
