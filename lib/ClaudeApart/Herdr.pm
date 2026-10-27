@@ -86,12 +86,14 @@ sub _run_herdr {
     return ($status == 0 && length $out) ? $out : undef;
 }
 
+# A workspace's label ('' when it has none), or undef when the lookup fails
+# (bad id, herdr missing, failing or slow, a reply without a label).
 sub workspace_label {
     my ($ws) = @_;
     return undef unless defined $ws && $ws =~ /\A[A-Za-z0-9]+\z/;
     my $d = _herdr_json('workspace', 'get', $ws) or return undef;
     my $l = eval { $d->{result}{workspace}{label} };
-    return undef unless defined $l && !ref $l && length $l;
+    return undef unless defined $l && !ref $l;
     utf8::encode($l);
     return $l;
 }
@@ -108,16 +110,19 @@ sub agent_pane {
 # ---- parsing herdr commands ---------------------------------------------------
 
 # Read kinds show a pane's content. Input kinds type into a pane, change
-# which profile a pane belongs to (rename, close, move), or stop panes and
-# agent setups of every profile (server, session, integration). Everything
-# else (list, get, create, split, focus, …) is "other". A key is the two or
-# three command words after `herdr`.
+# which profile a pane belongs to (rename, close, move), make a new shell
+# there (R51: pane split, tab create, worktree create/open; plain `claude` in
+# it takes that workspace's profile), or stop panes and agent setups of
+# every profile (server, session, integration). Everything else (list, get,
+# workspace create, focus, …) is "other"; workspace create only needs an
+# own label (R45). A key is the two or three command words after `herdr`.
 my %KIND = (
     (map { $_ => 'read' } 'pane read', 'pane wait-output', 'agent read', 'agent wait', 'agent explain',
         'terminal session observe', 'api snapshot'),
     (map { $_ => 'input' } 'pane run', 'pane send-keys', 'pane send-text', 'pane close', 'pane rename',
-        'pane move', 'pane swap', 'agent prompt', 'agent send-keys', 'agent start', 'agent rename',
-        'agent attach', 'workspace rename', 'workspace close', 'tab rename', 'tab close',
+        'pane move', 'pane swap', 'pane split', 'agent prompt', 'agent send-keys', 'agent start', 'agent rename',
+        'agent attach', 'workspace rename', 'workspace close', 'tab create', 'tab rename', 'tab close',
+        'worktree create', 'worktree open',
         'terminal session control', 'terminal attach', 'worktree remove', 'session attach',
         'session stop', 'session delete', 'server stop', 'integration install', 'integration uninstall'),
 );
@@ -178,8 +183,12 @@ sub command_kind { return (_kind(@_))[0] }
 #              positional after the command words (not for `agent start`,
 #              where it is a new name), every --pane/--source-pane/
 #              --target-pane/--tab/--workspace, and --current
-#              ($HERDR_PANE_ID). type is 'pane', 'agent', 'tab',
-#              'workspace' or 'terminal'; an undef id cannot be known (blocks);
+#              ($HERDR_PANE_ID). R51 defaults: `pane split` with no pane
+#              takes $HERDR_PANE_ID, `worktree create|open` with no
+#              --workspace takes $HERDR_WORKSPACE_ID, and `tab create` with
+#              no --workspace gets an unknown target. type is 'pane',
+#              'agent', 'tab', 'workspace' or 'terminal'; an undef id cannot
+#              be known (blocks);
 #   target  => the first target id;
 #   labels  => the workspace labels the command writes (undef: cannot be
 #              known, or herdr picks one itself);
@@ -236,6 +245,10 @@ sub parse_command {
         push @targets, map { [ $ID_OPT{$o}, defined $_ ? _value($_) : undef ] } @{ $opt{$o} || [] };
     }
     push @targets, [ 'pane', _value('$HERDR_PANE_ID') ] if $opt{'--current'};
+    push @targets, [ 'pane', _value('$HERDR_PANE_ID') ] if $cmd eq 'pane split' && !@targets;
+    push @targets, [ undef, undef ] if $cmd eq 'tab create' && !$opt{'--workspace'};
+    push @targets, [ 'workspace', _value('$HERDR_WORKSPACE_ID') ]
+        if $cmd =~ /\Aworktree (?:create|open)\z/ && !$opt{'--workspace'};
     push @targets, [ undef, undef ] if $unknown;
     $r{target} = @targets ? $targets[0][1] : undef;
     return \%r;

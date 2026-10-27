@@ -122,7 +122,8 @@ sub session_dir_profile {
     return undef;
 }
 
-# rc 0 = name printed, 5 = refused (inside a session), 6 = nothing resolvable
+# rc 0 = name printed, 5 = refused (inside a session), 6 = nothing resolvable,
+# 7 = inside Herdr, the workspace label could not be read (R52)
 sub cmd_resolve {
     my (@a) = @_;
     my $explicit;
@@ -148,7 +149,12 @@ sub cmd_resolve {
         unless (ClaudeApart::Config::profile($cfg, $pick)) { print STDERR "claude-apart: unknown profile in CLAUDE_APART_PROFILE.\n"; return 6 }
     } else {
         if (($ENV{HERDR_ENV} || "") eq "1" && length($ENV{HERDR_WORKSPACE_ID} || "")) {
+            # R52: a failed lookup refuses; a label with no profile means the default.
             my $label = ClaudeApart::Herdr::workspace_label($ENV{HERDR_WORKSPACE_ID});
+            unless (defined $label) {
+                print STDERR "claude-apart: could not read this Herdr workspace's label; start a profile explicitly with claude-<name>.\n";
+                return 7;
+            }
             $pick = ClaudeApart::Herdr::profile_for_label($cfg, $label);
         }
         $pick = ClaudeApart::Config::default_profile($cfg) unless defined $pick;

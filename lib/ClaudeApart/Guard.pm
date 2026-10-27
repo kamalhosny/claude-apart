@@ -712,20 +712,39 @@ my %APART_SAFE   = map { $_ => 1 } qw(status check help -h --help);
 my %APART_CMD    = map { $_ => 1 } qw(setup add remove login status check copy new sync uninstall help);
 my $ENV_NAME     = qr/CLAUDE_CONFIG_DIR|CLAUDE_APART_PROFILE|CLAUDE_CODE_CHILD_SESSION/;
 
-my $FIND_EXEC     = qr/\A-(?:exec|execdir|ok|okdir)\z/;
+my $FIND_EXEC    = qr/\A-(?:exec|execdir|ok|okdir)\z/;
 my %FEEDS_ARGS   = map { $_ => 1 } qw(xargs parallel);
+my $ASSIGN       = qr/\A[A-Za-z_][A-Za-z0-9_]*\+?=/;
+my %CMD_PREFIX   = map { $_ => 1 } qw(! { do then else elif if while until time exec command builtin
+    nohup env sudo nice noglob nocorrect);
+
+# R53: the index of the command word of a simple command: the first word
+# after VAR=… words, shell keywords (do, then, if, {, !, …) and plain
+# prefixes (env, nohup, sudo, …, with -options right after them). It is
+# past the end when there is none.
+sub _cmd_index {
+    my ($w) = @_;
+    my ($i, $prefix) = (0, 0);
+    for (; $i < @$w; $i++) {
+        my $x = $w->[$i];
+        if ($CMD_PREFIX{ _name($x) // '' }) { $prefix = 1; next }
+        next if $x =~ $ASSIGN || ($prefix && $x =~ /\A-/);
+        last;
+    }
+    return $i;
+}
 
 # R49: is the word at $k a command that gets words no one can see? Right
 # after find's -exec, -execdir, -ok or -okdir: yes, whatever follows it. As
-# the last word: only when the command (after VAR=… words) is xargs or
+# the last word: only when the command word (see _cmd_index) is xargs or
 # parallel, and not as the argument of which, type or command -v. Any other
 # last word is just an argument (`cat bin/claude-apart`, `ls ~/.config/herdr`).
 sub _fed_words {
     my ($w, $k) = @_;
     return 1 if $k > 0 && $w->[ $k - 1 ] =~ $FIND_EXEC;
     return 0 if $k < $#$w;
-    my ($head) = grep { $_ !~ /\A[A-Za-z_][A-Za-z0-9_]*\+?=/ } @$w;
-    my $n = defined $head ? _name($head) : undef;
+    my $c = _cmd_index($w);
+    my $n = $c < @$w ? _name($w->[$c]) : undef;
     return 0 unless defined $n && $FEEDS_ARGS{$n};
     return _lookup_only($w, $k) ? 0 : 1;
 }
@@ -743,11 +762,13 @@ sub _lookup_only {
 }
 
 # Another profile's launcher: a word, or an a=b piece of one, named
-# claude-<other profile>, or claude-<rest> where the rest cannot be known
-# (claude-$p, claude-`…`, claude-{a,b}).
+# claude-<other profile>. R53: claude-<rest> where the rest cannot be known
+# (claude-$p, claude-`…`, claude-{a,b}, claude-) blocks only as the command
+# word or a fed word (see _fed_words); as plain text it passes
+# (`grep -n claude- README.md`, `curl -o claude-$VER.tgz …`).
 # R42: `claude-apart` blocks when the next word is a known subcommand other
 # than status, check, help or `new <own profile>`; when it is an option other
-# than -h/--help, or cannot be known ($X, `…`). Any other next word is a
+# than -h/--help, or cannot be known ($X, `…`, xargs' {}). Any other next word is a
 # file, not a subcommand (`git add bin/claude-apart README.md`). Glued after
 # = (c=claude-apart) it may run later with any words: block. R49: after
 # find -exec, or last under xargs/parallel, it blocks (see _fed_words); any
@@ -759,19 +780,22 @@ sub _rule_launcher {
     for my $seg (@{ $sh->{segments} }) {
         my @it = @{ $seg->{words} };
         my @w  = map { $_->{w} } @it;
+        my $ci = _cmd_index(\@w);
         for my $k (0 .. $#it) {
             next if $it[$k]{nested};
             for my $p (ClaudeApart::Paths::word_pieces($w[$k])) {
                 my $n = _name($p);
                 next unless defined $n && $n =~ /\Aclaude-(.*)\z/is;
-                return 1 if $other{ lc $1 } || $1 eq '' || $1 =~ /[\$`{]/;
+                my $rest = $1;
+                return 1 if $other{ lc $rest };
+                return 1 if ($rest eq '' || $rest =~ /[\$`{]/) && ($k == $ci || _fed_words(\@w, $k));
             }
             next unless $w[$k] =~ $CLAUDE_APART;
             return 1 if index($w[$k], '=') >= 0 || _fed_words(\@w, $k);
             next if $k == $#w;
             my $sub = $w[ $k + 1 ];
             next if $APART_SAFE{$sub};
-            return 1 if $sub =~ /\A-|[\$`]/;
+            return 1 if $sub =~ /\A-|[\$`]/ || index($sub, '{}') >= 0;
             next unless $APART_CMD{$sub};
             next if $sub eq 'new' && $k + 2 <= $#w && $w[ $k + 2 ] eq $own;
             return 1;
@@ -812,7 +836,8 @@ sub _own_assignment {
 }
 
 # Herdr. A read needs every target in the own or a readable profile; input
-# (also rename, close, move, stop) needs the own profile. A target that maps
+# (also rename, close, move, stop, and R51: a new shell from pane split, tab
+# create, worktree create/open) needs the own profile. A target that maps
 # to no profile, a failed or slow lookup, and a command for another server
 # all block. On every herdr call, of any kind:
 # - R45: a workspace label it writes must start with the own <emoji> <TAG>
@@ -822,8 +847,10 @@ sub _own_assignment {
 #   $HERDR_PANE_ID and the like may be read;
 # - R47: herdr runs in the open. Blocked: herdr glued after = (h=herdr),
 #   command words that cannot be known, and a herdr read or input command
-#   after a word that cannot be known ($H pane read …, "$(which herdr)"
-#   pane read …) or at the start of a command (the rest of `$(…) pane read …`).
+#   right after a command word that cannot be known ($H pane read …,
+#   "$(which herdr)" pane read …; R53: not after a later word, as in
+#   `git -C "$R" worktree remove x`) or at the start of a command (the rest
+#   of `$(…) pane read …`).
 # - R49: herdr after find -exec, or last under xargs/parallel, blocks (see
 #   _fed_words); any other last herdr word passes (bare `herdr` needs a
 #   terminal; `ls ~/.config/herdr`, `command -v herdr`).
@@ -833,10 +860,11 @@ sub _rule_herdr {
     for my $seg (@{ $sh->{segments} }) {
         my @it = @{ $seg->{words} };
         my @w  = map { $_->{w} } @it;
+        my $ci = _cmd_index(\@w);
         for my $k (0 .. $#it) {
             next if $it[$k]{nested};
             if ($w[$k] !~ $HERDR_WORD) {
-                return 1 if ($k == 0 || $w[ $k - 1 ] =~ /[\$`]/)
+                return 1 if ($k == 0 || ($k - 1 == $ci && $w[ $k - 1 ] =~ /[\$`]/))
                     && ClaudeApart::Herdr::command_kind(@w[ $k .. $#w ]) ne 'other';
                 next;
             }

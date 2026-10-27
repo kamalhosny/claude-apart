@@ -121,7 +121,8 @@ test_claude_apart_allowlist() { # R42: a known subcommand outside the allowlist,
     'claude-apart uninstall' 'claude-apart copy personal work' '/opt/x/bin/claude-apart sync' \
     'claude-apart "$(echo copy)" personal work' 'claude-apart status && claude-apart sync' \
     'bash -c "claude-apart sync"' 'CLAUDE-APART sync' 'c=claude-apart; $c sync' \
-    'claude-apart ${X%/}' 'claude-apart "sy"nc' || return 1
+    'claude-apart ${X%/}' 'claude-apart "sy"nc' 'echo x | xargs -I{} claude-apart {} personal work' \
+    'xargs -I{} claude-apart {} < f' 'xargs -I{} claude-apart x{} < f' || return 1
   _allows personal 'claude-apart new personal' || return 1
   _blocks personal 'claude-apart new work' || return 1
 }
@@ -232,7 +233,7 @@ test_herdr_listing_allowed() {
   t_two_profiles
   _herdr_std
   _allows work 'herdr workspace list' 'herdr pane list' 'herdr agent list' 'herdr tab list --workspace w2' \
-    'herdr pane split --current --direction right --no-focus' 'herdr --help' 'herdr pane' || return 1
+    'herdr --help' 'herdr pane' || return 1
   [ ! -e "$T/herdr.calls" ] || { echo "listing needs no lookup"; return 1; }
 }
 
@@ -283,8 +284,9 @@ test_herdr_label_must_be_own() { # R45: every workspace label herdr writes start
     'herdr worktree create --branch b --label notes' 'herdr worktree open --path /tmp/wt --label "🟧 WORK · wt"' \
     'herdr pane move w2:p1 --new-workspace' || return 1
   _allows personal 'herdr workspace create --label "🟪 PERS · x" --cwd /tmp --no-focus' \
-    'herdr worktree create --branch b --label "🟪 PERS · b"' 'herdr worktree open --path /tmp/wt --label "🟪 PERS"' \
-    'herdr tab create --label notes' 'herdr pane move w2:p1 --new-tab --label notes' || return 1
+    'herdr worktree create --workspace w2 --branch b --label "🟪 PERS · b"' \
+    'herdr worktree open --workspace w2 --path /tmp/wt --label "🟪 PERS"' \
+    'herdr tab create --workspace w2 --label notes' 'herdr pane move w2:p1 --new-tab --label notes' || return 1
   _blocks work 'herdr workspace create --label "🟪 PERS · x"' || return 1
 }
 
@@ -326,6 +328,60 @@ test_trailing_word_rule() { # R49: a last claude-apart/herdr word blocks only un
   done
   for c in 'find . -name x -exec herdr {} \;' 'find . -execdir claude-apart {} \;' 'find . -ok herdr --help \;' \
     'find . -okdir claude-apart status \;' 'find . -exec /opt/bin/herdr \;' 'find . -exec claude-apart \;'; do
+    _run_bash work "$c" "$d"; _expect_block "work in proj: $c" || return 1
+  done
+}
+
+test_herdr_shell_makers_are_input() { # R51: a new or moved shell must land in the own profile
+  t_two_profiles
+  _herdr_std
+  _blocks personal 'herdr pane split w1:p1 --direction right --env ZDOTDIR=/tmp/x --no-focus' \
+    "herdr tab create --workspace w1 --env 'PROMPT_COMMAND=claude -p hi'" 'herdr tab create --workspace w3' \
+    'herdr tab create' 'herdr tab create --label notes' 'herdr pane split --direction right' \
+    'herdr pane split --current --direction right' 'herdr pane split w3:p1 --direction down' \
+    'herdr worktree create --workspace w1 --branch b --label "🟪 PERS · b"' \
+    'herdr worktree open --path /tmp/wt --label "🟪 PERS"' \
+    'herdr worktree create --cwd /tmp/r --branch b --label "🟪 PERS · b"' \
+    'herdr pane move w2:p1 --tab w1:t1 --split right' 'herdr pane move w1:p1 --tab w2:t1 --split right' \
+    'herdr pane move w2:p1 --new-tab --workspace w1' 'herdr pane move w2:p1 --new-tab --workspace w3' \
+    'herdr pane split w2:p1 --direction right --env HERDR_PANE_ID=w1:p1' || return 1
+  _allows personal 'herdr pane split w2:p1 --direction right --env ZDOTDIR=/tmp/x --no-focus' \
+    "herdr tab create --workspace w2 --env 'PROMPT_COMMAND=claude -p hi'" \
+    'herdr worktree create --workspace w2 --branch b --label "🟪 PERS · b"' \
+    'herdr pane move w2:p1 --tab w2:t3 --split down' 'herdr pane move w2:p1 --new-tab --workspace w2' \
+    'herdr pane move w2:p1 --new-workspace --label "🟪 PERS · z"' || return 1
+  HERDR_PANE_ID=w2:p4 _allows personal 'herdr pane split --direction right' \
+    'herdr pane split --current --direction down' || return 1
+  HERDR_PANE_ID=w1:p4 _blocks personal 'herdr pane split --direction right' || return 1
+  HERDR_WORKSPACE_ID=w2 _allows personal 'herdr worktree open --path /tmp/wt --label "🟪 PERS"' \
+    'herdr worktree create --cwd /tmp/r --branch b --label "🟪 PERS · b"' || return 1
+  HERDR_WORKSPACE_ID=w1 _blocks personal 'herdr worktree open --path /tmp/wt --label "🟪 PERS"' \
+    'herdr worktree create --workspace w2 --label "🟪 PERS · b" --pane w1:p1' || return 1
+  _allows work 'herdr tab create --workspace w1 --cwd /tmp' || return 1
+}
+
+test_tail_rule_only_after_command_word() { # R53: a herdr verb after a non-literal word blocks only after the command word
+  t_two_profiles
+  _herdr_std
+  _allows work 'git -C "$REPO" worktree remove .worktrees/x' 'git -C "$(pwd)" worktree remove x' \
+    'git --git-dir=$G worktree remove x' || return 1
+  _blocks work '$H pane read w2:p1' 'X=1 $H pane read w2:p1' 'nohup $H pane run w2:p1 ls' \
+    '"$(which herdr)" agent prompt me hi' '`which herdr` pane run w1:p2 ls' || return 1
+}
+
+test_launcher_rest_only_in_command_word() { # R53: claude-<unknown> counts only as the command or a fed word
+  t_two_profiles
+  local d="$T/proj" c
+  mkdir -p "$d/lib"
+  # from a project folder: from $HOME, `rg … lib` (no lib there) reads $HOME, which holds the other profile
+  for c in 'grep -n claude- README.md' "rg 'claude-' lib" 'git log --grep=claude-' \
+    'npm i -g @example/claude-code@$V' 'curl -o claude-$VER.tgz https://x' 'echo claude-{a,b}'; do
+    _run_bash work "$c" "$d"; _expect_allow "work in proj: $c" || return 1
+  done
+  for c in 'claude-$p -p x' 'claude-${P} -p x' 'for p in work personal; do claude-$p -p x; done' \
+    'xargs claude-$p' 'X=1 claude-$p -p x' 'nohup claude-$p -p x &' 'claude-{work,personal} -p x' \
+    'if true; then claude-$p; fi' 'echo hi | xargs claude-personal -p' \
+    'find . -exec claude-$p {} \;' 'find . -execdir claude- \;'; do
     _run_bash work "$c" "$d"; _expect_block "work in proj: $c" || return 1
   done
 }

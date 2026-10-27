@@ -131,19 +131,56 @@ test_herdr_label_prefix_only_matches_whole_tag() {
   assert_contains "$(_log)" "PROFILE=work" "no partial tag match" || return 1
 }
 
-test_herdr_missing_falls_back_to_default() {
-  t_two_profiles
-  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude
-  assert_rc 0 "claude" || return 1
-  assert_contains "$(_log)" "PROFILE=work" "default" || return 1
+_HERDR_UNREAD="claude-apart: could not read this Herdr workspace's label; start a profile explicitly with claude-<name>."
+
+_expect_herdr_refusal() { # <msg>: plain claude refused, nothing started (R52)
+  assert_rc 1 "$1" || return 1
+  assert_eq "$_HERDR_UNREAD" "$ERR" "$1: refusal text" || return 1
+  assert_eq "" "$(_log)" "$1: nothing started" || return 1
 }
 
-test_herdr_hang_falls_back_to_default() {
+test_herdr_missing_refuses() {
+  t_two_profiles
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude
+  _expect_herdr_refusal "herdr missing" || return 1
+}
+
+test_herdr_hang_refuses() {
   t_two_profiles
   printf '#!/bin/bash\nsleep 30\n' > "$T/bin/herdr"; chmod +x "$T/bin/herdr"
   HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude
+  _expect_herdr_refusal "herdr hangs" || return 1
+}
+
+test_herdr_error_or_bad_json_refuses() {
+  t_two_profiles
+  printf '#!/bin/bash\necho "{}"; exit 1\n' > "$T/bin/herdr"; chmod +x "$T/bin/herdr"
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude
+  _expect_herdr_refusal "herdr fails" || return 1
+  printf '#!/bin/bash\necho "not json"\n' > "$T/bin/herdr"
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude
+  _expect_herdr_refusal "bad json" || return 1
+  printf '#!/bin/bash\necho "{\\"result\\":{}}"\n' > "$T/bin/herdr"
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude
+  _expect_herdr_refusal "no label in the reply" || return 1
+}
+
+test_herdr_unread_label_keeps_explicit_launchers() {
+  t_two_profiles
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude-personal
+  assert_rc 0 "claude-personal" || return 1
+  assert_contains "$(_log)" "PROFILE=personal" "explicit launcher" || return 1
+  HERDR_ENV=1 run claude
+  assert_rc 0 "no workspace id" || return 1
+  assert_contains "$(_log)" "PROFILE=work" "default without a workspace id" || return 1
+}
+
+test_herdr_empty_label_falls_back_to_default() {
+  t_two_profiles
+  _herdr_stub ""
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude
   assert_rc 0 "claude" || return 1
-  assert_contains "$(_log)" "PROFILE=work" "default after timeout" || return 1
+  assert_contains "$(_log)" "PROFILE=work" "label read OK, no prefix" || return 1
 }
 
 test_no_config_passthrough() {
