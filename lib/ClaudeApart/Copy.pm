@@ -177,9 +177,10 @@ sub _src_statusline {
 }
 
 # What a command needs from the source folder. Returns the command for the
-# target, the files to carry (relative) and the first path that may not be carried.
+# target, the files to carry (relative) and, when it may not be copied, why
+# (the first path that may not be carried, or a path the target may not read).
 sub _plan {
-    my ($cmd, $fp, $tp, $sroot) = @_;
+    my ($cmd, $fp, $tp, $sroot, $read) = @_;
     my ($new, @files) = _rewrite($cmd, $fp->{abs_dir}, $tp->{abs_dir});
     my (%seen, @carry, $blocked);
     for my $rel (grep { !$seen{$_}++ } @files) {
@@ -188,7 +189,27 @@ sub _plan {
         next unless -e $src || -l $src;    # nothing there, nothing to leak
         if (_carriable($rel, $src, $sroot)) { push @carry, $rel } else { $blocked = $rel unless defined $blocked }
     }
-    return ($new, \@carry, $blocked);
+    return ($new, \@carry, _skip_reason($blocked, $fp->{name})) if defined $blocked;
+    # R75 (F5): the command as the target would run it must not read anything
+    # the target may not read (another profile's folder, the .claude.json
+    # family, a protected folder), matched the way the guard matches text.
+    my $hit = _reads_denied($new, $read);
+    return ($new, \@carry, defined $hit ? _clean(_b("reads $hit, which $tp->{name} may not read")) : undef);
+}
+
+# The first root of @$read that a command mentions (from $HOME), shown with ~/.
+# A check that fails counts as a hit.
+sub _reads_denied {
+    my ($cmd, $read) = @_;
+    my $home = $ENV{HOME};
+    for my $r (@{ $read || [] }) {
+        my $hit = eval { ClaudeApart::Paths::mentions($cmd, $r, $home) };
+        next if defined $hit && !$hit;
+        (my $show = $r) =~ s/\.\*\z//;
+        $show = '~' . substr($show, length $home) if defined $home && length $home > 1 && index($show, "$home/") == 0;
+        return $show;
+    }
+    return undef;
 }
 
 # R69: only a plain script-like file below a top-level folder that is not private.
@@ -332,7 +353,8 @@ sub items {
 
     # settings.json: hooks, status line, plain settings
     my $s = _src_settings($sroot);
-    my @listed = (_state_listed($sdir), _state_listed($tp->{abs_dir}));
+    my ($tread) = ClaudeApart::Config::foreign_paths($cfg, $to);
+    my @listed =(_state_listed($sdir), _state_listed($tp->{abs_dir}));
     if (ref $s->{hooks} eq 'HASH') {
         for my $ev (sort keys %{ $s->{hooks} }) {
             next unless ref $s->{hooks}{$ev} eq 'ARRAY' && $ev =~ /\A\w+\z/;
@@ -345,12 +367,12 @@ sub items {
                     my $cmd = ref $e eq 'HASH' && defined $e->{command} && !ref $e->{command} ? $e->{command} : undef;
                     push @prev, _clean(_b(defined $cmd ? $cmd : JSON::PP->new->canonical->encode($e)));
                     next unless defined $cmd;
-                    my (undef, $c, $b) = _plan($cmd, $fp, $tp, $sroot);
+                    my (undef, $c, $b) = _plan($cmd, $fp, $tp, $sroot, $tread);
                     push @carry, @$c;
                     $blocked = $b if defined $b && !defined $blocked;
                 }
                 my $m = ref $g eq 'HASH' && defined $g->{matcher} && !ref $g->{matcher} ? " (matcher $g->{matcher})" : '';
-                if (defined $blocked) { $add->('skip', "$ev#$i", "hook $ev#$i$m", [ _skip_reason($blocked, $from) ]); next }
+                if (defined $blocked) { $add->('skip', "$ev#$i", "hook $ev#$i$m", [ $blocked ]); next }
                 my %u;
                 push @prev, _carry_lines([ grep { !$u{$_}++ } @carry ], $sroot, $tcan, $to);
                 splice @prev, $PREVIEW_LINES;
@@ -360,8 +382,8 @@ sub items {
     }
     my $sl = _src_statusline($s, $fp, $from, @listed);
     if ($sl) {
-        my (undef, $c, $b) = _plan($sl->{command}, $fp, $tp, $sroot);
-        if (defined $b) { $add->('skip', 'statusLine', 'status line', [ _skip_reason($b, $from) ]) }
+        my (undef, $c, $b) = _plan($sl->{command}, $fp, $tp, $sroot, $tread);
+        if (defined $b) { $add->('skip', 'statusLine', 'status line', [ $b ]) }
         else { $add->('statusline', 'statusLine', 'status line', [ _clean(_b($sl->{command})), _carry_lines($c, $sroot, $tcan, $to) ]) }
     }
     my $tst = _read_state_quiet($tp->{abs_dir});
@@ -502,9 +524,9 @@ sub _copy_memory {
 # Copies the files a command points at under the source folder; returns the
 # command rewritten for the target. Refuses if it names anything not carriable.
 sub _carry_files {
-    my ($cmd, $fp, $tp, $sroot, $tcan) = @_;
-    my ($new, $carry, $blocked) = _plan($cmd, $fp, $tp, $sroot);
-    die _skip_reason($blocked, $fp->{name}) . "\n" if defined $blocked;
+    my ($cmd, $fp, $tp, $sroot, $tcan, $read) = @_;
+    my ($new, $carry, $blocked) = _plan($cmd, $fp, $tp, $sroot, $read);
+    die "$blocked\n" if defined $blocked;
     _copy_file($sroot, $tcan, $_) for @$carry;
     return $new;
 }
@@ -512,6 +534,7 @@ sub _carry_files {
 sub _copy_hook {
     my ($cfg, $fp, $tp, $sroot, $tcan, $to, $id) = @_;
     $id =~ /\A(\w+)#(\d+)\z/ or die "not a hook id\n";
+    my ($read) = ClaudeApart::Config::foreign_paths($cfg, $to);
     my ($ev, $i) = ($1, $2);
     my @listed = (_state_listed($fp->{abs_dir}), _state_listed($tp->{abs_dir}));
     my $g = (ref _src_settings($sroot)->{hooks} eq 'HASH' && ref _src_settings($sroot)->{hooks}{$ev} eq 'ARRAY') ? _src_settings($sroot)->{hooks}{$ev}[$i] : undef;
@@ -520,7 +543,7 @@ sub _copy_hook {
     my @new;
     for my $e (@h) {
         my $c = $enc->decode($enc->encode($e));    # deep copy
-        $c->{command} = _carry_files($c->{command}, $fp, $tp, $sroot, $tcan) if ref $c eq 'HASH' && defined $c->{command} && !ref $c->{command};
+        $c->{command} = _carry_files($c->{command}, $fp, $tp, $sroot, $tcan, $read) if ref $c eq 'HASH' && defined $c->{command} && !ref $c->{command};
         push @new, $c;
     }
     my $group = $enc->decode($enc->encode($g));
@@ -540,7 +563,8 @@ sub _copy_statusline {
     my $sl = _src_statusline(_src_settings($sroot), $fp, $from, @listed) or die "no status line to copy\n";
     my $enc = JSON::PP->new->canonical;
     my $new = $enc->decode($enc->encode($sl));
-    $new->{command} = _carry_files($new->{command}, $fp, $tp, $sroot, $tcan);
+    my ($read) = ClaudeApart::Config::foreign_paths($cfg, $to);
+    $new->{command} = _carry_files($new->{command}, $fp, $tp, $sroot, $tcan, $read);
     my $result = "copied statusline";
     ClaudeApart::Settings::modify($cfg, $to, sub {
         my ($d, $st) = @_;

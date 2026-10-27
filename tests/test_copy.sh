@@ -422,3 +422,32 @@ test_source_dir_in_other_case_counts_as_inside() {
   run capart_pl copy-items personal work
   assert_contains "$OUT" "which cannot be copied" "skipped" || return 1
 }
+
+test_hook_reading_target_denied_path_is_skipped() { # F5: a carried hook must not read what the target may not
+  _copy_fixture
+  capart config set-profile personal protect '~/Documents/private' || return 1
+  mkdir -p "$HOME/Documents/private"
+  cat > "$HOME/.claude/settings.json" <<'JSON'
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"cat ~/Documents/private/context.md"}]}],
+ "UserPromptSubmit":[{"hooks":[{"type":"command","command":"jq .oauthAccount ~/.claude.json"}]}],
+ "Stop":[{"hooks":[{"type":"command","command":"echo done"}]}]},
+ "statusLine":{"type":"command","command":"cat ~/Documents/private/status.txt"}}
+JSON
+  run capart_pl copy-items personal work
+  assert_rc 0 "items" || return 1
+  assert_not_contains "$OUT" $'hook\tSessionStart#0' "SessionStart not offered" || return 1
+  assert_not_contains "$OUT" $'hook\tUserPromptSubmit#0' "UserPromptSubmit not offered" || return 1
+  assert_not_contains "$OUT" $'statusline\tstatusLine' "status line not offered" || return 1
+  assert_contains "$OUT" $'hook\tStop#0' "a harmless hook is still offered" || return 1
+  assert_contains "$OUT" "reads ~/Documents/private, which work may not read" "protect reason" || return 1
+  assert_contains "$OUT" "reads ~/.claude.json, which work may not read" "identity file reason" || return 1
+  _apply personal work hook SessionStart#0
+  [ "$RC" != 0 ] || { echo "hook applied"; return 1; }
+  _apply personal work statusline statusLine
+  [ "$RC" != 0 ] || { echo "status line applied"; return 1; }
+  [ ! -e "$HOME/.claude-work/settings.json" ] || assert_not_contains "$(cat "$HOME/.claude-work/settings.json")" "Documents/private" "nothing written" || return 1
+  # with a grant (work may read personal) the same hook is fine
+  capart config set-profile work can_read personal || return 1
+  run capart_pl copy-items personal work
+  assert_contains "$OUT" $'hook\tSessionStart#0' "offered with a grant" || return 1
+}
