@@ -172,6 +172,22 @@ sub cmd_identity_check {
     return $st eq "ok" ? 0 : $st eq "missing" ? 3 : 4;
 }
 
+sub cmd_statusline {
+    my (@a) = @_;
+    my ($profile, $chain);
+    while (@a) {
+        my $f = shift @a;
+        if ($f eq "--profile" && @a) { $profile = shift @a }
+        elsif ($f eq "--chain" && @a) { $chain = shift @a }
+        else { return usage() }
+    }
+    return usage() unless defined $profile;
+    my $in = do { local $/; <STDIN> };
+    require ClaudeApart::Statusline;
+    print ClaudeApart::Statusline::render($profile, $chain, defined $in ? $in : "");
+    return 0;
+}
+
 my $cmd = shift @ARGV;
 unless (defined $cmd) { exit usage() }
 if ($cmd eq 'hook') {
@@ -188,6 +204,11 @@ if ($cmd eq 'config') {
 }
 if ($cmd eq "resolve" || $cmd eq "identity-check") {
     $rc = eval { $cmd eq "resolve" ? cmd_resolve(@ARGV) : cmd_identity_check(@ARGV) };
+    if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
+    exit $rc;
+}
+if ($cmd eq "statusline") {
+    $rc = eval { cmd_statusline(@ARGV) };
     if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
     exit $rc;
 }

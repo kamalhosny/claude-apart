@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use JSON::PP ();
 use ClaudeApart::Config;
+use ClaudeApart::Proc;
 
 my $TIMEOUT = 3;           # seconds for one herdr call
 my $MAX_OUT = 1 << 20;     # more output than this is a failure
@@ -43,47 +44,7 @@ sub _herdr_json {
 
 sub _run_herdr {
     my (@args) = @_;
-    require POSIX;
-    require Time::HiRes;
-    my ($r, $w);
-    pipe($r, $w) or return undef;
-    my $pid = fork();
-    unless (defined $pid) { close $r; close $w; return undef }
-    if (!$pid) {
-        no warnings 'exec';    # a failed exec returns; the exit code tells
-        close $r;
-        open STDOUT, '>&', $w or POSIX::_exit(127);
-        open STDERR, '>', '/dev/null';
-        open STDIN,  '<', '/dev/null';
-        exec { 'herdr' } 'herdr', @args or POSIX::_exit(127);
-    }
-    close $w;
-    my $deadline = Time::HiRes::time() + $TIMEOUT;
-    my ($out, $eof, $status) = ('', 0, undef);
-    while (1) {
-        my $left = $deadline - Time::HiRes::time();
-        last if $left <= 0;
-        if (!$eof) {    # read until end of file, at most until the deadline
-            my $rin = '';
-            vec($rin, fileno($r), 1) = 1;
-            my $n = select(my $rout = $rin, undef, undef, $left);
-            next if $n < 0 && $!{EINTR};
-            last if $n < 0;
-            next unless $n;
-            my $got = sysread($r, my $buf, 65536);
-            next if !defined $got && $!{EINTR};
-            last unless defined $got;
-            if ($got) { $out .= $buf; last if length $out > $MAX_OUT } else { $eof = 1 }
-            next;
-        }
-        my $done = waitpid($pid, POSIX::WNOHANG());
-        if ($done == $pid) { $status = $?; last }
-        last if $done < 0;
-        select(undef, undef, undef, 0.005);
-    }
-    close $r;
-    unless (defined $status) { kill 'KILL', $pid; waitpid($pid, 0); return undef }
-    return ($status == 0 && length $out) ? $out : undef;
+    return ClaudeApart::Proc::capture({ timeout => $TIMEOUT, max => $MAX_OUT }, "herdr", @args);
 }
 
 # A workspace's label ('' when it has none), or undef when the lookup fails
@@ -96,6 +57,31 @@ sub workspace_label {
     return undef unless defined $l && !ref $l;
     utf8::encode($l);
     return $l;
+}
+
+# A tab's label ('' when it has none), or undef when the lookup fails.
+sub tab_label {
+    my ($tab) = @_;
+    return undef unless defined $tab && $tab =~ $TAB;
+    my $d = _herdr_json('tab', 'get', $tab) or return undef;
+    my $l = eval { $d->{result}{tab}{label} };
+    return undef unless defined $l && !ref $l;
+    utf8::encode($l);
+    return $l;
+}
+
+# Rename a workspace or a tab. True when herdr accepted it; callers ignore
+# failure. Never cached (unlike the lookups).
+sub rename_workspace {
+    my ($ws, $label) = @_;
+    return 0 unless defined $ws && $ws =~ /\A$WS\z/ && defined $label && length $label;
+    return defined _run_herdr('workspace', 'rename', $ws, $label) ? 1 : 0;
+}
+
+sub rename_tab {
+    my ($tab, $label) = @_;
+    return 0 unless defined $tab && $tab =~ $TAB && defined $label && length $label;
+    return defined _run_herdr('tab', 'rename', $tab, $label) ? 1 : 0;
 }
 
 # The pane an agent (by name) is in, from `herdr agent get`, or undef.
