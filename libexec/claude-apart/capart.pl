@@ -58,7 +58,7 @@ sub cmd_config {
         return usage() unless @a >= 1;
         my ($name, @kv) = @a;
         my %f;
-        for my $kv (@kv) { $kv =~ /\A(\w+)=(.*)\z/s or return usage(); $f{$1} = $2 }
+        for my $kv (@kv) { $kv =~ /\A(\w+)=(.*)\z/ or return usage(); $f{$1} = $2 }
         my $cfg = -e $path ? ClaudeApart::Config::load($path) : ClaudeApart::Config::empty();
         ClaudeApart::Config::add_profile($cfg, $name, %f);
         ClaudeApart::Config::save($cfg, $path);
@@ -66,12 +66,14 @@ sub cmd_config {
     }
     my $cfg = ClaudeApart::Config::load($path);
     if ($sub eq 'profiles') {
-        print "$_\n" for ClaudeApart::Config::profile_names($cfg);
+        # R63: inside a session only the session's own profile is listed
+        print "$_\n" for session_visible($cfg, ClaudeApart::Config::profile_names($cfg));
     } elsif ($sub eq 'default') {
         my $d = ClaudeApart::Config::default_profile($cfg);
         print "$d\n" if defined $d;
     } elsif ($sub eq 'shell') {
         return usage() unless @a == 1;
+        session_allow($cfg, $a[0]) or return 1;
         my $p = ClaudeApart::Config::profile($cfg, $a[0]) or die "unknown profile: $a[0]\n";
         my %v = (
             NAME => $p->{name}, DIR => $p->{abs_dir}, ADOPTED => $p->{adopted} ? 1 : 0,
@@ -85,6 +87,12 @@ sub cmd_config {
         return usage() unless @a == 2;
         ClaudeApart::Config::set_top($cfg, $a[0], $a[1]);
         ClaudeApart::Config::save($cfg, $path);
+    } elsif ($sub eq 'set-fields') {
+        return usage() unless @a;
+        my @specs;
+        for my $s (@a) { $s =~ /\A([a-z][a-z0-9-]*)\.(\w+)=(.*)\z/ or return usage(); push @specs, [$1, $2, $3] }
+        ClaudeApart::Config::set_fields($cfg, @specs);
+        ClaudeApart::Config::save($cfg, $path);
     } elsif ($sub eq 'set-profile') {
         return usage() unless @a == 3;
         ClaudeApart::Config::set_profile($cfg, @a);
@@ -97,6 +105,25 @@ sub cmd_config {
         return usage();
     }
     return 0;
+}
+
+# R63: inside a Claude session these commands show only the session's own profile.
+sub in_session { return (($ENV{CLAUDE_CODE_CHILD_SESSION} || "") eq "1") ? 1 : 0 }
+
+sub session_allow {
+    my ($cfg, $name) = @_;
+    return 1 unless in_session();
+    my $own = session_profile($cfg);
+    return 1 if defined $own && $own eq $name;
+    print STDERR "claude-apart: inside Claude only this session's own profile can be read.\n";
+    return 0;
+}
+
+sub session_visible {
+    my ($cfg, @names) = @_;
+    return @names unless in_session();
+    my $own = session_profile($cfg);
+    return grep { defined $own && $_ eq $own } @names;
 }
 
 sub session_profile {
@@ -246,6 +273,7 @@ sub cmd_new {
 sub cmd_identity_read {
     my (@a) = @_;
     return usage() unless @a == 1;
+    session_allow(ClaudeApart::Config::load(ClaudeApart::Config::config_path()), $a[0]) or return 1;
     my $id = ClaudeApart::Identity::read($a[0]);
     return 3 unless $id;
     print "$id->{email}\n$id->{org}\n$id->{org_name}\n";
@@ -257,6 +285,8 @@ sub cmd_identity_read {
 sub cmd_identity_dup {
     my (@a) = @_;
     return usage() unless @a == 3;
+    # R63: a yes/no answer for a guessed account is a leak, so never inside a session
+    if (in_session()) { print STDERR "claude-apart: not available inside Claude.\n"; return 1 }
     my ($name, $email, $org) = @a;
     my $cfg = ClaudeApart::Config::load(ClaudeApart::Config::config_path());
     for my $n (ClaudeApart::Config::profile_names($cfg)) {
@@ -300,6 +330,50 @@ sub cmd_status {
     return 0;
 }
 
+# profile-remove <name>: writes the config WITHOUT the profile first (and drops
+# grants for it), then cleans the profile's settings using the old config. If
+# that cleanup fails the config is already changed: rc 3, and the leftover hooks
+# name an unknown profile, so they fail closed.
+sub cmd_profile_remove {
+    my (@a) = @_;
+    return usage() unless @a == 1;
+    my $path = ClaudeApart::Config::config_path();
+    my $old = ClaudeApart::Config::load($path);
+    die "unknown profile: $a[0]\n" unless ClaudeApart::Config::profile($old, $a[0]);
+    my $cfg = ClaudeApart::Config::load($path);
+    ClaudeApart::Config::remove_profile($cfg, $a[0]);
+    ClaudeApart::Config::save($cfg, $path);
+    require ClaudeApart::Settings;
+    unless (eval { ClaudeApart::Settings::uninstall($old, $a[0]); 1 }) {
+        my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e;
+        print STDERR "claude-apart: could not clean the settings of $a[0]: $e\n";
+        return 3;
+    }
+    return 0;
+}
+
+# path-rel <A> <B> (absolute paths): same | inside (A in B) | contains (A holds
+# B) | none. Symlinks, ".." and letter case on macOS are handled by the guard's
+# path code (device + inode).
+sub cmd_path_rel {
+    my (@a) = @_;
+    return usage() unless @a == 2 && $a[0] =~ m{^/} && $a[1] =~ m{^/};
+    require ClaudeApart::Paths;
+    my $in = ClaudeApart::Paths::under($a[0], $a[1]);
+    my $has = ClaudeApart::Paths::under($a[1], $a[0]);
+    print(($in && $has) ? "same\n" : $in ? "inside\n" : $has ? "contains\n" : "none\n");
+    return 0;
+}
+
+# canon <path>: the path with symlinks resolved.
+sub cmd_canon {
+    my (@a) = @_;
+    return usage() unless @a == 1 && $a[0] =~ m{^/};
+    require ClaudeApart::Paths;
+    print ClaudeApart::Paths::canon($a[0], '/'), "\n";
+    return 0;
+}
+
 my $cmd = shift @ARGV;
 unless (defined $cmd) { exit usage() }
 if ($cmd eq 'hook') {
@@ -314,9 +388,10 @@ if ($cmd eq 'config') {
     if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
     exit $rc;
 }
-if ($cmd =~ /\A(?:resolve|identity-check|identity-read|identity-dup|status)\z/) {
+if ($cmd =~ /\A(?:resolve|identity-check|identity-read|identity-dup|status|profile-remove|path-rel|canon)\z/) {
     my %h = (resolve => \&cmd_resolve, "identity-check" => \&cmd_identity_check, "identity-read" => \&cmd_identity_read,
-             "identity-dup" => \&cmd_identity_dup, status => \&cmd_status);
+             "identity-dup" => \&cmd_identity_dup, status => \&cmd_status,
+             "profile-remove" => \&cmd_profile_remove, "path-rel" => \&cmd_path_rel, canon => \&cmd_canon);
     $rc = eval { $h{$cmd}->(@ARGV) };
     if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
     exit $rc;

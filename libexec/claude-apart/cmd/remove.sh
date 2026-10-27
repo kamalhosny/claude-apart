@@ -2,36 +2,38 @@
 # Sourced by bin/claude-apart (and by setup). The profile's folder stays unless
 # --delete-dir is given and confirmed; even then only a folder that is safe.
 
-# rc 0 only when a profile's own folder may be deleted. Never the adopted
-# folder, never $HOME or anything outside it, never a link, never a folder
-# that holds or sits inside another profile's folder, and only a folder that
-# looks like a Claude config folder.
-_ca_dir_deletable() { # <name> <dir> <adopted>
-  local name=$1 d=$2 adopted=$3 real home p o
-  [ "$adopted" != 1 ] || { ca_err "the adopted folder ~/.claude is never deleted."; return 1; }
-  [ -n "$d" ] || return 1
+# rc 0 only when a profile's own folder may be deleted. Sets CA_REAL to the
+# exact path that was checked (symlinks resolved); that path is what gets
+# deleted. Never ~/.claude (any spelling or letter case), $HOME or anything
+# not strictly under it, never a link, never a folder that holds or sits
+# inside another profile's folder, and only a folder that looks like a Claude
+# config folder. A missing folder is fine (CA_REAL is empty).
+_ca_dir_deletable() { # <name> <dir>
+  local name=$1 d=$2 rel p o
+  CA_REAL=
+  ca_dir_plain "$d" || { ca_err "$d has a . or .. part; not deleting it."; return 1; }
   [ ! -L "$d" ] || { ca_err "$d is a link; not deleting it."; return 1; }
-  [ -d "$d" ] || return 0
-  real=$(cd "$d" && pwd -P) || return 1
-  home=$(cd "$HOME" && pwd -P) || return 1
-  case "$real" in "$home"/?*) ;; *) ca_err "$d is not inside your home folder; not deleting it."; return 1;; esac
-  [ "$real" != "$home/.claude" ] || { ca_err "the adopted folder ~/.claude is never deleted."; return 1; }
-  if [ ! -e "$real/.claude.json" ] && [ ! -e "$real/settings.json" ] && [ ! -e "$real/.claude-apart-state.json" ]; then
+  [ -e "$d" ] || return 0
+  CA_REAL=$(capart canon "$d") || { CA_REAL=; return 1; }
+  rel=$(capart path-rel "$CA_REAL" "$HOME") || return 1
+  [ "$rel" = inside ] || { ca_err "$d is not inside your home folder; not deleting it."; CA_REAL=; return 1; }
+  rel=$(capart path-rel "$CA_REAL" "$HOME/.claude") || return 1
+  [ "$rel" = none ] || { ca_err "~/.claude is never deleted."; CA_REAL=; return 1; }
+  if [ ! -e "$CA_REAL/.claude.json" ] && [ ! -e "$CA_REAL/settings.json" ] && [ ! -e "$CA_REAL/.claude-apart-state.json" ]; then
     ca_err "$d does not look like a Claude config folder; not deleting it."
-    return 1
+    CA_REAL=; return 1
   fi
   for p in $(capart config profiles); do
     [ "$p" = "$name" ] && continue
     o=$(ca_profile_var "$p" DIR)
-    o=$(cd "$o" 2>/dev/null && pwd -P) || continue
-    case "$real/" in "$o"/*) ca_err "$d overlaps another profile's folder; not deleting it."; return 1;; esac
-    case "$o/" in "$real"/*) ca_err "$d overlaps another profile's folder; not deleting it."; return 1;; esac
+    rel=$(capart path-rel "$CA_REAL" "$o") || return 1
+    [ "$rel" = none ] || { ca_err "$d overlaps the folder of profile $p; not deleting it."; CA_REAL=; return 1; }
   done
   return 0
 }
 
 ca_remove() {
-  local name delete=0 dir adopted p keep list r
+  local name delete=0 dir adopted others p rc=0 prc
   [ $# -ge 1 ] || { echo "Usage: claude-apart remove <name> [--delete-dir]" >&2; return 2; }
   name=$1; shift
   while [ $# -gt 0 ]; do
@@ -42,45 +44,61 @@ ca_remove() {
     shift
   done
   capart config profiles | grep -qx -- "$name" || { ca_err "unknown profile: $name"; return 1; }
-  if [ "$(capart config default)" = "$name" ]; then
+  others=0
+  for p in $(capart config profiles); do [ "$p" = "$name" ] || others=1; done
+  # the last profile may go even if it is the default
+  if [ "$others" = 1 ] && [ "$(capart config default)" = "$name" ]; then
     ca_err "$name is the default profile. Choose another default first (claude-apart setup, then: default)."
     return 1
   fi
   dir=$(ca_profile_var "$name" DIR)
   adopted=$(ca_profile_var "$name" ADOPTED)
-  # Refuse before changing anything.
-  if [ "$delete" = 1 ]; then
-    _ca_dir_deletable "$name" "$dir" "$adopted" || return 1
+  # R64: the adopted folder is what a launcher miss lands in; the others stay
+  # in place until it is the last one.
+  if [ "$adopted" = 1 ] && [ "$others" = 1 ]; then
+    ca_err "$name is the adopted profile (~/.claude). Remove the other profiles first."
+    return 1
   fi
 
-  capart settings uninstall --profile "$name" >/dev/null || { ca_err "could not clean $name's settings; nothing removed."; return 1; }
-  # Other profiles must not keep a read grant for a name that no longer exists.
-  for p in $(capart config profiles); do
-    [ "$p" = "$name" ] && continue
-    list=$(ca_profile_var "$p" CAN_READ)
-    keep=
-    for r in $list; do [ "$r" = "$name" ] || keep="$keep $r"; done
-    keep=${keep# }
-    [ "$keep" = "$list" ] || capart config set-profile "$p" can_read "$keep" || return 1
-  done
-  capart config remove-profile "$name" || return 1
-  install_links || return 1
+  # Everything is checked and asked BEFORE anything changes.
+  if [ "$delete" = 1 ]; then
+    if [ "$adopted" = 1 ]; then ca_err "the adopted folder ~/.claude is never deleted."; return 1; fi
+    _ca_dir_deletable "$name" "$dir" || return 1
+    if [ -z "$CA_REAL" ]; then
+      echo "There is no folder $dir to delete."
+      delete=0
+    elif ! ask_yn "Delete the folder $dir and everything in it?"; then
+      delete=0
+    fi
+  fi
+  if [ "$delete" = 0 ] && [ "$others" = 1 ] && [ -e "$dir" ]; then
+    ca_err "$dir will no longer be protected from the other profiles."
+    ask_yn "Remove profile $name anyway?" || { echo "Nothing changed."; return 1; }
+  fi
+
+  # Config first, then the profile's settings; a failed cleanup leaves hooks
+  # that name an unknown profile, and those fail closed.
+  capart profile-remove "$name"
+  prc=$?
+  if [ "$prc" = 3 ]; then rc=1
+  elif [ "$prc" != 0 ]; then return 1
+  fi
+  install_links || rc=1
   echo "Removed profile $name."
 
-  if [ "$delete" = 1 ] && [ -d "$dir" ]; then
-    if ask_yn "Delete the folder $dir and everything in it?"; then
-      # checked again right before the delete
-      if _ca_dir_deletable "$name" "$dir" "$adopted"; then rm -rf -- "$dir"; echo "Deleted $dir."; fi
-    else
-      echo "Kept $dir."
+  if [ "$delete" = 1 ] && [ "$prc" = 0 ]; then
+    # checked again right before the delete, and the checked path is deleted
+    if _ca_dir_deletable "$name" "$dir" && [ -n "$CA_REAL" ]; then
+      rm -rf -- "$CA_REAL" && echo "Deleted $dir."
     fi
-  else
+  elif [ -e "$dir" ]; then
     echo "The folder $dir was kept."
   fi
 
   # R61: the others drop their rules for this profile's folders.
   if [ -n "$(capart config profiles)" ]; then
     . "$CA_ROOT/libexec/claude-apart/cmd/sync.sh"
-    ca_sync
+    ca_sync || rc=1
   fi
+  return "$rc"
 }

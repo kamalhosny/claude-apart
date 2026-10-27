@@ -1,8 +1,10 @@
 # Tests for login, setup, add, remove and status.
 
-# Config lines, trimmed, without blanks and comments, sorted (order and spacing do not matter).
+# Config lines, trimmed, without blanks and comments, each prefixed with its section
+# (order and spacing do not matter, but a value swapped between profiles shows).
 _cfg_norm() {
-  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" | grep -v '^#' | grep -v '^$' | LC_ALL=C sort
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" | grep -v '^#' | grep -v '^$' \
+    | awk '/^\[/ { sec = $0; next } { print sec "|" $0 }' | LC_ALL=C sort
 }
 
 # work has no recorded identity yet (profile exists, nothing logged in).
@@ -13,11 +15,7 @@ _work_unlogged() {
   rm -f "$HOME/.claude-work/.claude.json"
 }
 
-_cfg_value() { # <profile> <var>: CA_<var> from config shell
-  local CA_NAME CA_DIR CA_ADOPTED CA_TAG CA_EMOJI CA_COLOUR CA_EMAIL CA_ORG CA_CAN_READ CA_THEME CA_TMPDIR
-  eval "$(capart config shell "$1")"
-  eval "printf '%s' \"\$CA_$2\""
-}
+_cfg_value() { ca_profile_var "$1" "$2"; }
 
 test_login_records_identity() {
   _work_unlogged || return 1
@@ -155,7 +153,10 @@ test_setup_menu_default_and_grants() {
 test_setup_menu_remove_asks_for_default() {
   t_two_profiles
   run bash -c "printf 'remove\nwork\ndone\n' | claude-apart setup"
-  # work is the default: refused, the menu goes on
+  # work is the default: refused, the menu goes on and ends with done
+  assert_rc 0 "menu ends with done" || return 1
+  assert_contains "$ERR" "is the default profile" "refusal message" || return 1
+  assert_contains "$OUT" "Profile not removed." "menu says so" || return 1
   assert_contains "$(capart config profiles)" "work" "work still there" || return 1
 }
 
@@ -223,10 +224,21 @@ test_add_adopt() {
   [ ! -e "$FAKE_LOG" ] || { echo "login was run"; return 1; }
 }
 
-test_add_adopt_without_login_refused() {
+test_add_adopt_without_login_runs_login() {
   t_two_profiles
   rm -f "$XDG_CONFIG_HOME/claude-apart/config" "$HOME/.claude.json"
-  run claude-apart add personal --adopt < /dev/null
+  export FAKE_LOGIN_EMAIL=p@example.com FAKE_LOGIN_ORG=org-p
+  run bash -c "printf '\n\ny\n' | claude-apart add personal --adopt"
+  assert_rc 0 "adopt with login" || return 1
+  assert_contains "$(cat "$FAKE_LOG")" "CONFIG_DIR=<unset> PROFILE= ARGS=auth login" "login for ~/.claude" || return 1
+  assert_eq p@example.com "$(_cfg_value personal EMAIL)" "recorded" || return 1
+}
+
+test_add_adopt_without_login_refused_when_login_empty() {
+  t_two_profiles
+  rm -f "$XDG_CONFIG_HOME/claude-apart/config" "$HOME/.claude.json"
+  export FAKE_LOGIN_EMAIL=p@example.com FAKE_LOGIN_ORG=
+  run bash -c "printf '\n\ny\n' | claude-apart add personal --adopt"
   [ "$RC" != 0 ] || { echo "expected failure"; return 1; }
   [ ! -e "$XDG_CONFIG_HOME/claude-apart/config" ] || { echo "config written"; return 1; }
 }
@@ -264,61 +276,171 @@ test_status_hides_others_in_session() {
   assert_contains "$OUT" "work" "own profile shown" || return 1
 }
 
-test_status_hides_others_in_session_without_profile_env() {
+
+test_status_session_with_mismatched_env_shows_nothing() {
   t_two_profiles
+  # CLAUDE_CONFIG_DIR unset means the adopted profile; the env name says work: undecidable
   CLAUDE_CODE_CHILD_SESSION=1 CLAUDE_APART_PROFILE=work run claude-apart status
-  # CLAUDE_CONFIG_DIR unset means the adopted profile: the env name disagrees, so nothing is shown
-  assert_not_contains "$OUT" "p@example.com" "no leak" || return 1
-  assert_not_contains "$OUT" "w@example.com" "nothing" || return 1
+  assert_rc 6 "cannot tell" || return 1
+  assert_eq "" "$OUT" "no output" || return 1
+  assert_not_contains "$ERR" "@example.com" "no email" || return 1
 }
+
+test_status_session_own_line() {
+  t_two_profiles
+  CLAUDE_CODE_CHILD_SESSION=1 CLAUDE_APART_PROFILE=work CLAUDE_CONFIG_DIR="$HOME/.claude-work" run claude-apart status
+  assert_rc 0 "status" || return 1
+  assert_contains "$OUT" "🟧 WORK work  ~/.claude-work  w@example.com  w@example.com  -  guard:no" "own line" || return 1
+}
+
+# ---- R63: another profile's data does not reach a session ----
+
+_in_work_session() { # <cmd...>
+  CLAUDE_CODE_CHILD_SESSION=1 CLAUDE_APART_PROFILE=work CLAUDE_CONFIG_DIR="$HOME/.claude-work" run "$@"
+}
+
+test_session_identity_read_only_own() {
+  t_two_profiles
+  _in_work_session capart identity-read personal
+  [ "$RC" != 0 ] || { echo "expected refusal"; return 1; }
+  assert_not_contains "$OUT$ERR" "p@example.com" "no other email" || return 1
+  _in_work_session capart identity-read work
+  assert_rc 0 "own" || return 1
+  assert_contains "$OUT" "w@example.com" "own identity" || return 1
+}
+
+test_session_identity_dup_refused() {
+  t_two_profiles
+  _in_work_session capart identity-dup work p@example.com org-p
+  [ "$RC" != 0 ] || { echo "expected refusal"; return 1; }
+  assert_eq "" "$OUT" "no answer" || return 1
+}
+
+test_session_config_shell_and_profiles_only_own() {
+  t_two_profiles
+  _in_work_session capart config shell personal
+  [ "$RC" != 0 ] || { echo "expected refusal"; return 1; }
+  assert_not_contains "$OUT$ERR" "p@example.com" "no other email" || return 1
+  _in_work_session capart config shell work
+  assert_rc 0 "own shell" || return 1
+  _in_work_session capart config profiles
+  assert_eq work "$OUT" "only own profile listed" || return 1
+}
+
+test_outside_session_identity_dup_works() {
+  t_two_profiles
+  run capart identity-dup work p@example.com org-p
+  assert_rc 0 "found" || return 1
+  assert_eq personal "$OUT" "names the profile" || return 1
+}
+
+# ---- remove ----
 
 test_remove_keeps_dir() {
   t_two_profiles
   capart config set default personal
   run claude-apart sync
-  run claude-apart remove work
+  run bash -c "printf 'y\n' | claude-apart remove work"
   assert_rc 0 "remove" || return 1
   [ -d "$HOME/.claude-work" ] || { echo "dir deleted"; return 1; }
   assert_eq personal "$(capart config profiles)" "config has no work" || return 1
   [ ! -e "$T/prefix/bin/claude-work" ] || { echo "launcher left"; return 1; }
 }
 
+test_remove_unprotected_warning_asks_default_no() {
+  t_two_profiles
+  capart config set default personal
+  run claude-apart sync
+  local before; before=$(cat "$XDG_CONFIG_HOME/claude-apart/config")
+  run bash -c "printf 'n\n' | claude-apart remove work"
+  assert_rc 1 "declined" || return 1
+  assert_contains "$ERR" "$HOME/.claude-work will no longer be protected from the other profiles." "warning" || return 1
+  assert_eq "$before" "$(cat "$XDG_CONFIG_HOME/claude-apart/config")" "unchanged" || return 1
+  run claude-apart remove work < /dev/null
+  assert_rc 1 "eof" || return 1
+  assert_eq "$before" "$(cat "$XDG_CONFIG_HOME/claude-apart/config")" "unchanged on eof" || return 1
+  grep -q claude-apart "$HOME/.claude-work/settings.json" || { echo "work settings touched"; return 1; }
+}
+
+test_remove_adopted_refused_while_others_exist() {
+  t_two_profiles
+  capart config set default work
+  run bash -c "printf 'y\ny\n' | claude-apart remove personal"
+  assert_rc 1 "refused" || return 1
+  assert_contains "$ERR" "Remove the other profiles first" "message" || return 1
+  assert_contains "$(capart config profiles)" "personal" "kept" || return 1
+}
+
+test_remove_adopted_ok_when_last() {
+  t_two_profiles
+  capart config remove-profile work
+  capart config set default personal
+  run claude-apart remove personal
+  assert_rc 0 "last one" || return 1
+  [ -d "$HOME/.claude" ] || { echo "dir gone"; return 1; }
+}
+
 test_remove_cleans_work_settings_and_resyncs_others() {
   t_two_profiles
   capart config set default personal
   run claude-apart sync
-  run claude-apart remove work
+  run bash -c "printf 'y\n' | claude-apart remove work"
   assert_rc 0 "remove" || return 1
   assert_not_contains "$(cat "$HOME/.claude/settings.json")" ".claude-work" "personal has no rule for work" || return 1
   assert_not_contains "$(cat "$HOME/.claude-work/settings.json" 2>/dev/null)" "claude-apart" "work settings cleaned" || return 1
   assert_not_contains "$(cat "$XDG_CONFIG_HOME/claude-apart/config")" "can_read" "grant pruned" || return 1
 }
 
+test_remove_config_first_when_cleanup_fails() {
+  t_two_profiles
+  capart config set default personal
+  run claude-apart sync
+  mv "$HOME/.claude-work/settings.json" "$T/elsewhere.json"
+  ln -s "$T/elsewhere.json" "$HOME/.claude-work/settings.json"
+  run bash -c "printf 'y\n' | claude-apart remove work"
+  [ "$RC" != 0 ] || { echo "expected a failure rc"; return 1; }
+  assert_contains "$ERR" "could not clean the settings of work" "message" || return 1
+  assert_eq personal "$(capart config profiles)" "config already changed" || return 1
+  assert_not_contains "$(cat "$HOME/.claude/settings.json")" ".claude-work" "others still re-synced" || return 1
+}
+
 test_remove_default_refused() {
   t_two_profiles
   run claude-apart sync
   run claude-apart remove work
-  [ "$RC" != 0 ] || { echo "expected failure"; return 1; }
+  assert_rc 1 "default refused" || return 1
+  assert_contains "$ERR" "is the default profile" "message" || return 1
   assert_contains "$(capart config profiles)" "work" "still there" || return 1
 }
 
 test_remove_unknown_profile() {
   t_two_profiles
   run claude-apart remove nope
-  [ "$RC" != 0 ] || return 1
+  assert_rc 1 "unknown" || return 1
 }
 
 test_remove_delete_dir_asks_and_deletes() {
   t_two_profiles
   capart config set default personal
-  run bash -c "printf 'n\n' | claude-apart remove work --delete-dir"
+  # no to the delete, then no to the warning: nothing changes
+  run bash -c "printf 'n\nn\n' | claude-apart remove work --delete-dir"
+  assert_rc 1 "declined" || return 1
   [ -d "$HOME/.claude-work" ] || { echo "deleted without yes"; return 1; }
-  t_two_profiles
-  capart config set default personal
+  assert_contains "$(capart config profiles)" work "profile kept" || return 1
   run bash -c "printf 'y\n' | claude-apart remove work --delete-dir"
   assert_rc 0 "remove" || return 1
   [ ! -e "$HOME/.claude-work" ] || { echo "dir still there"; return 1; }
   [ -d "$HOME" ] || return 1
+}
+
+test_remove_delete_dir_missing_dir_says_so() {
+  t_two_profiles
+  capart config set default personal
+  rm -rf "$HOME/.claude-work"
+  run claude-apart remove work --delete-dir
+  assert_rc 0 "remove" || return 1
+  assert_contains "$OUT" "no folder" "says nothing to delete" || return 1
+  assert_not_contains "$OUT" "was kept" "not kept" || return 1
 }
 
 test_remove_delete_dir_refuses_adopted() {
@@ -344,7 +466,7 @@ test_remove_delete_dir_refuses_home_and_outside() {
   [ -d "$out" ] || { echo "outside dir deleted"; return 1; }
 }
 
-test_remove_delete_dir_refuses_symlink_and_other_profiles_dir() {
+test_remove_delete_dir_refuses_symlink() {
   t_two_profiles
   capart config set default personal
   mkdir -p "$T/real"
@@ -354,8 +476,184 @@ test_remove_delete_dir_refuses_symlink_and_other_profiles_dir() {
   [ -d "$T/real" ] || { echo "target deleted"; return 1; }
 }
 
+test_remove_delete_dir_refuses_overlap_with_other_profile() {
+  t_two_profiles
+  capart config set default personal
+  mkdir -p "$HOME/.claude-work/sub"
+  capart config add-profile lab "dir=$HOME/.claude-work/sub" tag=LAB emoji=🟦 colour=blue || return 1
+  run bash -c "printf 'y\ny\n' | claude-apart remove work --delete-dir"
+  [ "$RC" != 0 ] || { echo "overlap: expected failure"; return 1; }
+  assert_contains "$ERR" "overlaps the folder of profile lab" "message" || return 1
+  [ -d "$HOME/.claude-work/sub" ] || { echo "nested dir deleted"; return 1; }
+  assert_contains "$(capart config profiles)" work "nothing changed" || return 1
+}
+
+# Probe 1: a ".." behind a symlink. The check and the delete must see one folder.
+test_remove_delete_dir_refuses_dotdot_behind_symlink() {
+  t_two_profiles
+  capart config set default personal
+  mkdir -p "$T/outside/x" "$T/outside/.claude-work"
+  : > "$T/outside/.claude-work/.claude.json"
+  ln -s "$T/outside/x" "$HOME/a"
+  capart config set-profile work dir "$HOME/a/../.claude-work" || return 1
+  run bash -c "printf 'y\ny\n' | claude-apart remove work --delete-dir"
+  [ "$RC" != 0 ] || { echo "expected failure"; return 1; }
+  [ -e "$T/outside/.claude-work/.claude.json" ] || { echo "outside folder deleted"; return 1; }
+  [ -d "$HOME/.claude-work" ] || { echo "home folder deleted"; return 1; }
+}
+
+# Probe 2: another spelling of ~/.claude (case-insensitive disks) is never deleted.
+test_remove_delete_dir_refuses_other_case_of_adopted() {
+  t_two_profiles
+  capart config set default personal
+  echo '{}' > "$HOME/.claude/settings.json"   # looks like a config folder, so only the path check can stop it
+  capart config set-profile work dir '~/.CLAUDE' || return 1
+  run bash -c "printf 'y\ny\n' | claude-apart remove work --delete-dir"
+  [ -f "$HOME/.claude.json" ] && [ -d "$HOME/.claude" ] || { echo "adopted folder damaged"; return 1; }
+  if [ -d "$HOME/.CLAUDE" ]; then
+    [ "$RC" != 0 ] || { echo "expected failure"; return 1; }
+  fi
+}
+
 test_remove_refused_in_session() {
   t_two_profiles
   CLAUDE_CODE_CHILD_SESSION=1 run claude-apart remove work
   assert_rc 1 "refused" || return 1
+}
+
+# ---- add: folder clashes, injection, duplicates, messages ----
+
+_add_refused() { # <args...>: add must fail, run no login, change nothing
+  local before; before=$(cat "$XDG_CONFIG_HOME/claude-apart/config")
+  run claude-apart add "$@" < /dev/null
+  [ "$RC" != 0 ] || { echo "accepted: $*"; return 1; }
+  assert_eq "$before" "$(cat "$XDG_CONFIG_HOME/claude-apart/config")" "config unchanged for: $*" || return 1
+  [ ! -e "$FAKE_LOG" ] || { echo "login ran for: $*"; return 1; }
+}
+
+test_add_refuses_dir_clashes() {
+  t_two_profiles
+  export FAKE_LOGIN_EMAIL=n@example.com FAKE_LOGIN_ORG=org-n
+  mkdir -p "$HOME/box/lab"
+  capart config add-profile lab "dir=$HOME/box/lab" tag=LAB emoji=🟦 colour=blue || return 1
+  _add_refused n --dir "$HOME/.claude-work/." || return 1
+  _add_refused n --dir "$HOME/x/../y" || return 1
+  _add_refused n --dir "$HOME/.claude-work/.." || return 1
+  _add_refused n --dir '~/.CLAUDE' || return 1
+  _add_refused n --dir "$HOME/./.claude" || return 1
+  _add_refused n --dir "$HOME/.claude/sub" || return 1
+  _add_refused n --dir "$HOME/.claude-work/sub" || return 1
+  _add_refused n --dir "$HOME/box" || return 1
+  _add_refused n --dir "$HOME" || return 1
+}
+
+test_add_adopt_refuses_duplicate_account() {
+  t_two_profiles
+  capart config remove-profile personal
+  capart config set default work
+  t_login_as "$HOME/.claude.json" w@example.com org-w   # ~/.claude holds work's account
+  run bash -c "printf '\n\ny\n' | claude-apart add personal --adopt"
+  [ "$RC" != 0 ] || { echo "expected failure"; return 1; }
+  assert_contains "$ERR" "already used by profile work" "message" || return 1
+  assert_not_contains "$OUT$ERR" "w@example.com" "no email" || return 1
+  assert_eq work "$(capart config profiles)" "rolled back" || return 1
+  [ ! -e "$FAKE_LOG" ] || { echo "logout ran on the existing login"; return 1; }
+  assert_contains "$(cat "$HOME/.claude.json")" w@example.com "login kept" || return 1
+}
+
+test_add_rejects_control_characters() {
+  t_two_profiles
+  _add_refused n --emoji $'E\ncan_read = personal' || return 1
+  _add_refused n --colour $'blue\n[profile x]' || return 1
+  _add_refused n --tag $'T\nx' || return 1
+  _add_refused n --dir $'/tmp/a\nb' || return 1
+  _add_refused $'ok\nbad' || return 1
+  run capart config add-profile n 'emoji=E
+can_read = personal'
+  [ "$RC" != 0 ] || { echo "capart accepted a newline"; return 1; }
+  run capart config set-profile work emoji $'E\nX'
+  [ "$RC" != 0 ] || { echo "set-profile accepted a newline"; return 1; }
+  assert_not_contains "$(cat "$XDG_CONFIG_HOME/claude-apart/config")" "can_read = personal" "no injected line" || return 1
+}
+
+test_add_name_checked_before_prompts() {
+  t_two_profiles
+  run bash -c "printf 'EMOJI\n' | claude-apart add Bad"
+  [ "$RC" != 0 ] || return 1
+  assert_not_contains "$ERR" "Emoji for" "no prompt before the name check" || return 1
+}
+
+test_set_fields_is_all_or_nothing() {
+  t_two_profiles
+  local before; before=$(cat "$XDG_CONFIG_HOME/claude-apart/config")
+  run capart config set-fields work.email=a@example.com work.bogus=1
+  [ "$RC" != 0 ] || return 1
+  assert_eq "$before" "$(cat "$XDG_CONFIG_HOME/claude-apart/config")" "unchanged" || return 1
+}
+
+test_add_tag_default_is_four_characters() {
+  t_two_profiles
+  capart config add-profile longername || return 1
+  assert_eq LONG "$(_cfg_value longername TAG)" "config default" || return 1
+}
+
+test_add_sync_failure_has_own_rc_and_message() {
+  t_two_profiles
+  run claude-apart sync
+  mv "$HOME/.claude/settings.json" "$T/elsewhere.json"
+  ln -s "$T/elsewhere.json" "$HOME/.claude/settings.json"
+  export FAKE_LOGIN_EMAIL=n@example.com FAKE_LOGIN_ORG=org-n
+  run bash -c "printf '\n\ny\n' | claude-apart add lab"
+  assert_rc 3 "added but sync failed" || return 1
+  assert_contains "$ERR" "was added, but the sync failed" "message" || return 1
+  assert_contains "$(capart config profiles)" lab "profile exists" || return 1
+  # setup's wording for the same case
+  capart config remove-profile lab
+  run bash -c "printf 'add\nlab\n\n\ny\ndone\n' | claude-apart setup"
+  assert_contains "$OUT" "Profile added; run claude-apart sync" "setup wording" || return 1
+  assert_not_contains "$OUT" "Profile not added." "not the failure text" || return 1
+}
+
+# ---- login ----
+
+test_login_failed_login_logs_out() {
+  _work_unlogged || return 1
+  export FAKE_LOGIN_EMAIL=w2@example.com FAKE_LOGIN_ORG=org-w2 FAKE_RC=1
+  run bash -c "printf 'y\n' | claude-apart login work"
+  [ "$RC" != 0 ] || { echo "expected failure"; return 1; }
+  assert_contains "$(cat "$FAKE_LOG")" "auth logout" "logged out after a failed login" || return 1
+}
+
+test_login_uses_profile_temp_folder() {
+  _work_unlogged || return 1
+  export FAKE_LOGIN_EMAIL=w2@example.com FAKE_LOGIN_ORG=org-w2
+  run bash -c "printf 'y\n' | claude-apart login work"
+  local tmp="$HOME/.local/state/claude-apart/tmp/work"
+  assert_contains "$(cat "$FAKE_LOG")" "TMPDIR_CC=$tmp" "CLAUDE_CODE_TMPDIR set" || return 1
+  assert_eq 700 "$(perl -e 'printf "%o", (stat shift)[2] & 0777' "$tmp")" "mode" || return 1
+}
+
+# ---- setup ----
+
+test_setup_menu_grants_eof_changes_nothing() {
+  t_two_profiles
+  local before; before=$(cat "$XDG_CONFIG_HOME/claude-apart/config")
+  # first answer given, then the input ends
+  run bash -c "printf 'grants\nn\n' | claude-apart setup"
+  assert_rc 1 "eof" || return 1
+  assert_eq "$before" "$(cat "$XDG_CONFIG_HOME/claude-apart/config")" "config unchanged" || return 1
+  [ ! -e "$HOME/.claude/settings.json" ] || { echo "synced after eof"; return 1; }
+}
+
+test_setup_fresh_without_claude_json_offers_adopt_and_logs_in() {
+  t_two_profiles
+  rm -f "$XDG_CONFIG_HOME/claude-apart/config" "$HOME/.claude.json"
+  rm -rf "$HOME/.claude-work"
+  export FAKE_LOGIN_EMAIL=p@example.com FAKE_LOGIN_ORG=org-p
+  # adopt y, name, emoji, colour, confirm | no more | default
+  run bash -c "printf 'y\n\n\n\ny\n\n\n' | claude-apart setup"
+  assert_rc 0 "setup" || return 1
+  assert_contains "$OUT$ERR" "Adopt ~/.claude" "offer shown" || return 1
+  assert_contains "$(cat "$FAKE_LOG")" "CONFIG_DIR=<unset> PROFILE= ARGS=auth login" "login for ~/.claude" || return 1
+  assert_eq p@example.com "$(_cfg_value personal EMAIL)" "recorded" || return 1
 }

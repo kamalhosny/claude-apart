@@ -26,9 +26,7 @@ case "$self" in
   *)        echo "claude-apart: unknown launcher name." >&2; exit 1 ;;
 esac
 
-unset CA_NAME CA_DIR CA_ADOPTED CA_TAG CA_EMOJI CA_COLOUR CA_EMAIL CA_ORG CA_CAN_READ CA_THEME CA_TMPDIR
-shellvars=$(capart config shell "$profile") || exit 1
-eval "$shellvars"
+ca_load_profile "$profile" || exit 1
 
 case "${args[0]:-}" in
   -v|--version|-h|--help) ;;

@@ -36,12 +36,48 @@ ask_yn() { # <prompt> [y|n]; default no
   case "$reply" in y|Y|yes|YES|Yes) return 0;; *) return 1;; esac
 }
 
-# One value of a profile from the config: ca_profile_var <profile> <NAME|DIR|ADOPTED|TAG|EMOJI|COLOUR|EMAIL|ORG|CAN_READ>.
-ca_profile_var() {
-  local CA_NAME CA_DIR CA_ADOPTED CA_TAG CA_EMOJI CA_COLOUR CA_EMAIL CA_ORG CA_CAN_READ CA_THEME CA_TMPDIR s
+# The one list of the shell variables `capart config shell` prints.
+CA_VARS="NAME DIR ADOPTED TAG EMOJI COLOUR EMAIL ORG CAN_READ THEME TMPDIR"
+
+# Sets CA_<VAR> for one profile (clears the old values first).
+ca_load_profile() { # <name>
+  local v s
+  for v in $CA_VARS; do unset "CA_$v"; done
   s=$(capart config shell "$1") || return 1
   eval "$s"
-  eval "printf '%s\n' \"\$CA_$2\""
+}
+
+# One value of a profile from the config: ca_profile_var <profile> <VAR from CA_VARS>.
+ca_profile_var() {
+  ( ca_load_profile "$1" || exit 1; eval "printf '%s\n' \"\$CA_$2\"" )
+}
+
+# rc 1 when a folder path has a "." or ".." part: the checks and the delete
+# must see the same folder.
+ca_dir_plain() { # <path>
+  case "/$1/" in */./*|*/../*) return 1;; esac
+  return 0
+}
+
+# Checks a profile folder against every other profile (skip <skip name>), the
+# home folder and ~/.claude: same folder, inside one, or holding one are all
+# refused (symlinks, letter case and inodes are handled by capart path-rel).
+# <allow_claude>=1 lets the folder be ~/.claude itself (adopting). Message on stderr.
+ca_dir_conflict() { # <abs dir> <skip name> <allow_claude>
+  local d=$1 skip=$2 allow=$3 p o rel
+  rel=$(capart path-rel "$d" "$HOME") || return 1
+  case "$rel" in same|contains) ca_err "that folder is, or holds, your home folder."; return 1;; esac
+  if [ "$allow" != 1 ]; then
+    rel=$(capart path-rel "$d" "$HOME/.claude") || return 1
+    [ "$rel" = none ] || { ca_err "that folder overlaps ~/.claude, which belongs to the adopted profile."; return 1; }
+  fi
+  for p in $(capart config profiles 2>/dev/null); do
+    [ "$p" = "$skip" ] && continue
+    o=$(ca_profile_var "$p" DIR)
+    rel=$(capart path-rel "$d" "$o") || return 1
+    [ "$rel" = none ] || { ca_err "that folder overlaps the folder of profile $p."; return 1; }
+  done
+  return 0
 }
 
 ca_err() { echo "claude-apart: $*" >&2; }

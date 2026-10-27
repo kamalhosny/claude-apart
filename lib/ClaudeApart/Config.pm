@@ -20,10 +20,22 @@ sub config_path {
 
 sub _trim { my $s = shift; $s =~ s/^\s+//; $s =~ s/\s+$//; return $s }
 
+# A value written to the config must stay on one line.
+sub _check_text {
+    my ($what, $v) = @_;
+    die "$what must not contain a newline or other control character\n" if defined $v && $v =~ /[\x00-\x1f\x7f]/;
+}
+
 sub _check_name {
     my ($n) = @_;
+    _check_text("profile name", $n);
+    _check_name_rule($n);
+}
+
+sub _check_name_rule {
+    my ($n) = @_;
     die "bad profile name '$n' (use lowercase letters, digits, dashes; start with a letter)\n"
-        unless $n =~ /^[a-z][a-z0-9-]{0,30}$/;
+        unless $n =~ /\A[a-z][a-z0-9-]{0,30}\z/;
     die "profile name 'apart' is not allowed\n" if $n eq 'apart';
 }
 
@@ -196,6 +208,7 @@ sub save {
 
 sub set_top {
     my ($cfg, $key, $val) = @_;
+    _check_text("value", $val);
     die "unknown key '$key'\n" unless $key eq 'default';
     die "unknown profile: $val\n" unless $cfg->{profiles}{$val};
     $cfg->{default} = $val;
@@ -203,6 +216,7 @@ sub set_top {
 
 sub set_profile {
     my ($cfg, $name, $field, $val) = @_;
+    _check_text("value", $val);
     die "unknown profile: $name\n" unless $cfg->{profiles}{$name};
     die "unknown key '$field'\n" unless $FIELD{$field};
     $cfg->{profiles}{$name}{$field} = $val;
@@ -215,10 +229,11 @@ sub add_profile {
     die "profile '$name' already exists\n" if $cfg->{profiles}{$name};
     my $tag = uc $name;
     $tag =~ s/-//g;
-    $tag = substr($tag, 0, 6);
+    $tag = substr($tag, 0, 4);
     $cfg->{profiles}{$name} = { dir => "~/.claude-$name", tag => $tag };
     for my $k (sort keys %f) {
         die "unknown key '$k'\n" unless $FIELD{$k};
+        _check_text("value", $f{$k});
         $cfg->{profiles}{$name}{$k} = $f{$k};
     }
     push @{ $cfg->{order} }, $name;
@@ -229,8 +244,27 @@ sub remove_profile {
     my ($cfg, $name) = @_;
     die "unknown profile: $name\n" unless $cfg->{profiles}{$name};
     delete $cfg->{profiles}{$name};
+    # a grant for a profile that is gone must not come back if the name is reused
+    for my $o (@{ $cfg->{order} }) {
+        my $p = $cfg->{profiles}{$o};
+        next unless defined $p->{can_read} && length $p->{can_read};
+        $p->{can_read} = join " ", grep { $_ ne $name } _list($p->{can_read});
+    }
     $cfg->{order} = [ grep { $_ ne $name } @{ $cfg->{order} } ];
     $cfg->{default} = undef if defined $cfg->{default} && $cfg->{default} eq $name;
+}
+
+# Several profile fields in one validated change: ([name, field, value], ...).
+sub set_fields {
+    my ($cfg, @specs) = @_;
+    for my $s (@specs) {
+        my ($name, $field, $val) = @$s;
+        die "unknown profile: $name\n" unless $cfg->{profiles}{$name};
+        die "unknown key '$field'\n" unless $FIELD{$field};
+        _check_text("value", $val);
+        $cfg->{profiles}{$name}{$field} = $val;
+    }
+    validate($cfg);
 }
 
 1;

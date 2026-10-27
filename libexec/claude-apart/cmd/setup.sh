@@ -17,21 +17,30 @@ _ca_eof_stop() {
 
 # For every ordered pair (A, B): may A read B's things? Current answer is the default.
 _ca_grants() {
-  local a b cur list
+  local a b cur list cur_yes specs=()
   for a in $(capart config profiles); do
     list=
     cur=$(ca_profile_var "$a" CAN_READ)
     for b in $(capart config profiles); do
       [ "$a" = "$b" ] && continue
-      if case " $cur " in *" $b "*) true;; *) false;; esac; then
-        ask_yn "May $a read $b's things?" y && list="$list $b"
-      else
-        ask_yn "May $a read $b's things?" && list="$list $b"
-      fi
+      case " $cur " in *" $b "*) cur_yes=y;; *) cur_yes=n;; esac
+      ask_yn "May $a read $b's things?" "$cur_yes" && list="$list $b"
       _ca_eof_stop || return 1
     done
-    capart config set-profile "$a" can_read "${list# }" || return 1
+    specs[${#specs[@]}]="$a.can_read=${list# }"
   done
+  # all answers are in: one write (nothing changes if the input ended early)
+  [ ${#specs[@]} -eq 0 ] || capart config set-fields "${specs[@]}"
+}
+
+# Runs add and says what happened (rc 3 = added, sync failed).
+_ca_add_say() {
+  ca_add "$@"
+  case $? in
+    0) ;;
+    3) echo "Profile added; run claude-apart sync to finish." ;;
+    *) echo "Profile not added." ;;
+  esac
 }
 
 _ca_resync() { install_links && ca_sync; }
@@ -63,7 +72,7 @@ _ca_setup_menu() {
       add)
         ask_to n "Name of the new profile" ""
         _ca_eof_stop || return 1
-        [ -z "$n" ] || ca_add "$n" || echo "Profile not added." ;;
+        [ -z "$n" ] || _ca_add_say "$n" ;;
       remove)
         ask_to n "Profile to remove" ""
         _ca_eof_stop || return 1
@@ -93,21 +102,20 @@ ca_setup() {
   # 2. adopt ~/.claude
   echo "Anything that starts claude without the launcher uses ~/.claude, so it is"
   echo "best to adopt ~/.claude for your private account (a miss then lands there)."
-  if [ -f "$HOME/.claude.json" ]; then
-    if ask_yn "Adopt ~/.claude as a profile?" y; then
-      ask_to n "Name for it" personal
-      _ca_eof_stop || return 1
-      ca_add "$n" --adopt || echo "Not adopted."
-    fi
+  # offered even with no login there yet: add then runs the login for it
+  if ask_yn "Adopt ~/.claude as a profile?" y; then
+    ask_to n "Name for it" personal
     _ca_eof_stop || return 1
+    _ca_add_say "$n" --adopt
   fi
+  _ca_eof_stop || return 1
 
   # 3. more profiles
   while :; do
     ask_to n "Add a profile? Name, or Enter to finish" ""
     _ca_eof_stop || return 1
     [ -n "$n" ] || break
-    ca_add "$n" || echo "Profile not added."
+    _ca_add_say "$n"
     _ca_eof_stop || return 1
   done
   [ -n "$(capart config profiles 2>/dev/null)" ] || { ca_err "no profile was added."; return 1; }

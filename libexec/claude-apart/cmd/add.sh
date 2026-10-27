@@ -1,6 +1,6 @@
 # claude-apart add <name> [--dir D] [--tag T] [--emoji E] [--colour C] [--adopt]
-# Sourced by bin/claude-apart (and by setup). Returns non-zero on any
-# problem and leaves no half-made profile behind.
+# Sourced by bin/claude-apart (and by setup). rc 0 = added; 1 = not added (no
+# half-made profile is left behind); 3 = added, but the final sync failed.
 
 _ca_sh() { . "$CA_ROOT/libexec/claude-apart/cmd/$1.sh"; }
 
@@ -19,8 +19,14 @@ _ca_free_pick() {
   echo "${1%%:*}"
 }
 
+# rc 1 when a value has a newline or another control character.
+_ca_plain_text() { # <what> <value>
+  case "$2" in *[[:cntrl:]]*) ca_err "$1 must not contain a newline or other control character."; return 1;; esac
+  return 0
+}
+
 ca_add() {
-  local name dir= tag= emoji= colour= adopt=0 cfg had_cfg=0 abs p other
+  local name dir= tag= emoji= colour= adopt=0 cfg had_cfg=0 abs p re='^[a-z][a-z0-9-]{0,30}$' fields rc
   [ $# -ge 1 ] || { echo "Usage: claude-apart add <name> [--dir D] [--tag T] [--emoji E] [--colour C] [--adopt]" >&2; return 2; }
   name=$1; shift
   while [ $# -gt 0 ]; do
@@ -34,9 +40,11 @@ ca_add() {
     esac
     shift
   done
-  # R14: same rule as the config; checked here so nothing is asked first.
-  case "$name" in apart) ca_err "the name 'apart' is not allowed."; return 1;; esac
-  printf '%s' "$name" | grep -Eq '^[a-z][a-z0-9-]{0,30}$' \
+  # R14: same rule as the config, checked first so nothing is asked before it.
+  _ca_plain_text "the name" "$name" && _ca_plain_text "the folder" "$dir" && _ca_plain_text "the tag" "$tag" \
+    && _ca_plain_text "the emoji" "$emoji" && _ca_plain_text "the colour" "$colour" || return 1
+  [ "$name" != apart ] || { ca_err "the name 'apart' is not allowed."; return 1; }
+  [[ $name =~ $re ]] \
     || { ca_err "bad profile name '$name' (lowercase letters, digits and dashes; start with a letter; at most 31)."; return 1; }
   cfg=${XDG_CONFIG_HOME:-$HOME/.config}/claude-apart/config
   [ -e "$cfg" ] && had_cfg=1
@@ -50,59 +58,56 @@ ca_add() {
     dir='~/.claude'
   else
     [ -n "$dir" ] || dir="~/.claude-$name"
-    case "$dir" in "$HOME"/*) dir="~/${dir#"$HOME"/}" ;; esac
-    case "$dir" in /*|"~/"?*) ;; *) ca_err "the folder must be an absolute path (or start with ~/)."; return 1 ;; esac
+    case "$dir" in "~/"*) abs="$HOME/${dir#"~/"}" ;; *) abs=$dir ;; esac
+    case "$abs" in /*) ;; *) ca_err "the folder must be an absolute path (or start with ~/)."; return 1 ;; esac
+    ca_dir_plain "$abs" || { ca_err "the folder must not have a . or .. part."; return 1; }
+    abs=${abs%/}
+    ca_dir_conflict "$abs" "" 0 || return 1
+    case "$abs" in "$HOME"/*) dir="~/${abs#"$HOME"/}" ;; *) dir=$abs ;; esac
   fi
-  dir=${dir%/}
-  abs=$dir
-  case "$abs" in "~/"*) abs="$HOME/${abs#"~/"}" ;; esac
-  [ "$abs" != "$HOME" ] && [ "$abs" != / ] || { ca_err "that folder cannot be a profile folder."; return 1; }
-  if [ "$had_cfg" = 1 ]; then
-    for p in $(capart config profiles); do
-      other=$(ca_profile_var "$p" DIR)
-      [ "$other" = "$abs" ] && { ca_err "that folder is already used by profile $p."; return 1; }
-    done
+  if [ "$adopt" = 1 ]; then
+    ca_dir_conflict "$HOME/.claude" "" 1 || return 1
   fi
-  [ -n "$tag" ] || tag=$(printf '%s' "$name" | tr 'a-z' 'A-Z' | tr -d - | cut -c1-4)
   if [ -z "$emoji" ]; then
     ask_to emoji "Emoji for $name" "$(_ca_free_pick EMOJI 🟪 🟧 🟦 🟩 🟥 🟨)"
   fi
   if [ -z "$colour" ]; then
     ask_to colour "Colour for $name" "$(_ca_free_pick COLOUR purple:135 orange:208 blue:33 green:40 red:196 yellow:220)"
   fi
-  capart config add-profile "$name" "dir=$dir" "tag=$tag" "emoji=$emoji" "colour=$colour" || return 1
+  _ca_plain_text "the emoji" "$emoji" && _ca_plain_text "the colour" "$colour" || return 1
+  # the tag default (uppercased name, 4 characters) lives in the config code
+  fields=("dir=$dir" "emoji=$emoji" "colour=$colour")
+  [ -z "$tag" ] || fields[${#fields[@]}]="tag=$tag"
+  capart config add-profile "$name" "${fields[@]}" || return 1
 
   if [ "$adopt" = 1 ]; then
-    if ! _ca_adopt_identity "$name"; then
-      _ca_add_rollback "$name" "$had_cfg" "$cfg"
-      return 1
-    fi
+    _ca_adopt_identity "$name" || { _ca_add_rollback "$name" "$had_cfg" "$cfg"; return 1; }
   else
     _ca_sh login
-    if ! _ca_login_core "$name"; then
-      _ca_add_rollback "$name" "$had_cfg" "$cfg"
-      return 1
-    fi
+    _ca_login_core "$name" || { _ca_add_rollback "$name" "$had_cfg" "$cfg"; return 1; }
   fi
   [ -n "$(capart config default)" ] || capart config set default "$name"
   _ca_sh sync
-  install_links && ca_sync
+  if ! { install_links && ca_sync; }; then
+    ca_err "profile $name was added, but the sync failed; run: claude-apart sync"
+    return 3
+  fi
 }
 
-# Records the account that is already logged in at ~/.claude (no login).
+# Adopting ~/.claude: an account already logged in there is confirmed, never
+# logged out; with none, the login runs for it. Both use the duplicate check.
 _ca_adopt_identity() { # <name>
   local id email org oname
-  id=$(capart identity-read "$1") || { ca_err "no logged-in account found in ~/.claude; log in with plain claude first."; return 1; }
-  { IFS= read -r email; IFS= read -r org; IFS= read -r oname; } <<EOF2
+  _ca_sh login
+  if id=$(capart identity-read "$1"); then
+    { IFS= read -r email; IFS= read -r org; IFS= read -r oname; } <<EOF2
 $id
 EOF2
-  if [ -z "$email" ] || [ -z "$org" ]; then
-    ca_err "the account in ~/.claude shows no email or organisation; cannot adopt it."
-    return 1
+    _ca_confirm_identity "$1" "$email" "$org" "$oname" 0
+  else
+    echo "No logged-in account found in ~/.claude; logging in."
+    _ca_login_core "$1"
   fi
-  echo "Found $email (organisation: ${oname:-$org}) in ~/.claude."
-  ask_yn "Use this account for $1?" || return 1
-  capart config set-profile "$1" email "$email" && capart config set-profile "$1" org "$org"
 }
 
 # Undo a half-finished add: the profile goes; the folder and logins stay.
