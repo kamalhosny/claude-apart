@@ -25,6 +25,9 @@ my %SAFE_VAR = map { $_ => 1 } qw(LANG LANGUAGE TZ COLUMNS LINES TERM NO_COLOR C
 my %ALWAYS_READER = map { $_ => 1 } qw(ugrep rg ag ack find fd tree du tar zip rsync);
 my %CWD_DEFAULT   = map { $_ => 1 } qw(grep egrep fgrep zgrep ugrep rg ag ack find fd tree du ls);
 my %PATTERN_FIRST = map { $_ => 1 } qw(grep egrep fgrep zgrep ugrep rg ag ack fd);
+# Names _is_reader / _is_modifier can accept (a quick filter for _find_cmd).
+my %READER_NAME   = map { $_ => 1 } keys %ALWAYS_READER, qw(grep egrep fgrep zgrep ls cp scp);
+my %MODIFIER_NAME = map { $_ => 1 } qw(rm chmod chown chgrp xattr find ditto);
 
 # Keys of other tools' inputs whose values are paths (ancestor rule).
 my %PATH_KEY = map { $_ => 1 } qw(path paths dir directory root cwd file file_path filepath
@@ -186,14 +189,25 @@ sub _shell {
 # (bash -c "…", "$(…)") is analysed one level deeper; its segments count as
 # run only for $(…) and backticks. Each word item is
 # {w => text, sp => [spellings of its path pieces]}. Relative words are taken
-# from every folder in $sh->{dirs} (see _cd_dirs).
+# from every folder in $sh->{dirs}, and from the "missing" folders in
+# $sh->{holes} when they climb out of them (see _cd_dirs).
 sub _analyse {
     my ($ctx, $cmd) = @_;
-    my $sh = { text => $cmd, dirs => _cd_dirs($ctx, $cmd), segments => [] };
+    my $sh = { text => $cmd, segments => [], memo => {} };
+    @$sh{qw(dirs holes)} = _cd_dirs($ctx, $cmd);
     _walk($ctx, $sh, $cmd, 0, 1);
     $sh->{spellings} = [ ClaudeApart::Paths::uniq(
         map { map { @{ $_->{sp} } } @{ $_->{words} }, @{ $_->{redirects} } } @{ $sh->{segments} }) ];
     return $sh;
+}
+
+# Does a word hold shell code to analyse one level deeper? Code nested
+# deeper than $MAX_DEPTH cannot be checked, so that is an error (blocks).
+sub _nested {
+    my ($w, $depth) = @_;
+    return 0 unless $w =~ $CODE;
+    die "shell code nested too deep\n" if $depth >= $MAX_DEPTH;
+    return 1;
 }
 
 sub _walk {
@@ -223,78 +237,230 @@ sub _walk {
 
 sub _item {
     my ($ctx, $sh, $w, $depth, $exec) = @_;
-    my @sp = map { ClaudeApart::Paths::candidate_spellings($_, $sh->{dirs}, $ctx->{write}) }
-             ClaudeApart::Paths::word_pieces($w);
-    if ($depth < $MAX_DEPTH && $w =~ $CODE) {
-        _walk($ctx, $sh, $w, $depth + 1, ($exec && $w =~ /\$\(|`/) ? 1 : 0);
-    }
+    my @sp = map { _piece($ctx, $sh, $_) } ClaudeApart::Paths::word_pieces($w);
+    _walk($ctx, $sh, $w, $depth + 1, ($exec && $w =~ /\$\(|`/) ? 1 : 0) if _nested($w, $depth);
     return { w => $w, sp => [ ClaudeApart::Paths::uniq(@sp) ] };
+}
+
+# The spellings of one path piece, from every folder of the command.
+sub _piece {
+    my ($ctx, $sh, $p) = @_;
+    my $m = $sh->{memo};
+    return @{ $m->{$p} } if $m->{$p};
+    my @sp = ClaudeApart::Paths::candidate_spellings($p, $sh->{dirs}, $ctx->{write}, 1);
+    my $c = ClaudeApart::Paths::climb_ub($p);
+    for my $h (@{ $sh->{holes} }) {
+        push @sp, ClaudeApart::Paths::candidate_spellings($p, [ $h->[0] ], $ctx->{write}, 1) if $c >= $h->[1];
+    }
+    $m->{$p} = [ ClaudeApart::Paths::uniq(@sp) ];
+    return @{ $m->{$p} };
 }
 
 # R8, union form: the folders a command may run in are the session cwd and
 # every cd/pushd/chdir target written anywhere in it (after time, noglob,
-# builtin, eval …, in quoted code, heredocs and comments). There is no order
-# and no "did it run". A target is taken from the cwd, and again from every
-# folder found so far, as long as that gives a new folder that exists
-# (`cd ~; cd .claude`, `cd a; cd b; cd ../..`): a cd into a missing folder
-# fails, so only the cwd round keeps missing ones (`mkdir x && cd x`).
-# zsh's `cd old new` also swaps old for new in those folders. popd, `cd -`,
-# $OLDPWD and targets with an unknown variable add nothing: they go back to
-# folders already counted. More than $MAX_DIRS folders is an error.
-# Returns the spellings of all the folders.
+# builtin, eval …, in quoted code, heredocs and comments; see _cd_scan).
+# There is no order and no "did it run".
+#
+# Every target is taken from every folder found so far, until nothing new
+# turns up. Every spelling of a folder (as written, through each symlink,
+# the real path) is a base, because `cd l; cd ../..` climbs from the
+# spelling the shell keeps in $PWD. Two spellings count as one base when
+# they agree on what the command can reach from them: the same real folder,
+# and the same for each of their parents up to $U levels ($U = the most
+# ".." any word or target has). A spelling that lies in or holds a root
+# (other than its real path) is kept as written.
+#
+# A folder that does not exist may be made by the command (`mkdir -p a/b &&
+# cd a/b`), so it is kept too, but only by what matters: from a missing
+# folder, a word reaches something else only by climbing out of the missing
+# part. So a missing folder below the existing folder E becomes the
+# "holes" E/<hole>, E/<hole>/<hole>, … up to $U levels deep; words and
+# targets that climb that far are taken from them. A missing folder that is
+# a root, or holds one, is kept as written (up to $U levels below the
+# deepest root).
+#
+# CDPATH (from the environment and from CDPATH=… / cdpath=(…) in the
+# command): a relative target is also taken from each entry.
+#
+# More than $MAX_DIRS real folders is an error.
+# Returns ([bases], [[hole, depth], …]).
 sub _cd_dirs {
     my ($ctx, $text) = @_;
-    my (@all, %have, %canon);
-    my $add = sub {    # keeps every spelling; returns those of folders not seen before
-        my (@new, %fresh);
-        for my $s (@_) {
-            next if $have{$s}++;
-            push @all, $s;
-            my $c = ClaudeApart::Paths::canon($s, '/');
-            $fresh{$c} = 1 unless $canon{$c};
-            push @new, $s if $fresh{$c};
-        }
-        %canon = (%canon, %fresh);
-        die "too many cd directories\n" if keys %canon > $MAX_DIRS;
-        return @new;
-    };
-    my @bases = $add->(ClaudeApart::Paths::spellings($ctx->{cwd}, '/'));
-    my @targets = _cd_targets($ctx, $text, 0);
-    my $first = 1;
-    while (@bases && @targets) {
-        my @found;
-        for my $t (@targets) {
-            for my $b (@bases) {
-                my @s = ref $t ? _swap($t, $b) : ClaudeApart::Paths::candidate_spellings($t, [$b], $ctx->{write});
-                push @found, @s if $first || grep { -d $_ } @s;
-            }
-        }
-        @bases = $add->(@found);
-        $first = 0;
+    my $scan = { targets => [], swaps => [], cdpath => [], climb => 0 };
+    _cd_scan($text, 0, $scan);
+    my @cwd = ClaudeApart::Paths::spellings($ctx->{cwd}, '/');
+    my @t = ClaudeApart::Paths::uniq(@{ $scan->{targets} });
+    my @cdpath = ClaudeApart::Paths::uniq(grep { length && $_ ne '.' }
+        (defined $ENV{CDPATH} ? split(/:/, $ENV{CDPATH}) : ()), @{ $scan->{cdpath} });
+    if (@cdpath) {
+        my @rel = grep { !_is_absolute($_, "\x02") } @t;
+        @t = ClaudeApart::Paths::uniq(@t, map { my $e = $_; map { "$e/$_" } @rel } @cdpath);
     }
-    return \@all;
+    my %sw;
+    my @targets = (@t, grep { !$sw{"$_->[0]\0$_->[1]"}++ } @{ $scan->{swaps} });
+    my %climb = map { $_ => ClaudeApart::Paths::climb_ub($_) } @t;
+    return (\@cwd, []) unless @targets;
+
+    my $U = $scan->{climb};
+    for my $t (@t) { $U = $climb{$t} if $climb{$t} > $U }
+    my $set = $ctx->{write};
+    my $deep = 0;
+    for (@{ $set->{abs} }, @{ $set->{fam} }) { my $d = tr{/}{}; $deep = $d if $d > $deep }
+
+    my (@bases, @holes, @queue, %sig, %part, %canon, %seen, %hole);
+    my $base = sub {
+        my ($s) = @_;
+        return if $sig{ _sig($s, $U, $set, \%part) }++;
+        push @bases, $s;
+        push @queue, [ $s, 0 ];
+        $canon{ ClaudeApart::Paths::canon($s, '/') } = 1;
+        die "too many cd directories\n" if keys %canon > $MAX_DIRS;
+    };
+    my $consider = sub {
+        my ($s) = @_;
+        return if $seen{$s}++ || index($s, $ClaudeApart::Paths::HOLE) >= 0;
+        my ($e, $k) = ClaudeApart::Paths::dir_prefix($s);
+        return $base->($s) unless $k;
+        my $h = $e eq '/' ? '' : $e;
+        for my $j (1 .. $U) {
+            $h .= "/$ClaudeApart::Paths::HOLE";
+            next if $hole{$h}++;
+            push @holes, [ $h, $j ];
+            push @queue, [ $h, $j ];
+            die "too many missing cd directories\n" if @holes > 8 * $MAX_DIRS;
+        }
+        $base->($s) if _missing_root($set, $e, $s) && ($s =~ tr{/}{}) <= $deep + $U;
+    };
+    $base->($_) for @cwd;    # the session cwd counts even when it is missing
+    $seen{$_} = 1 for @cwd;
+    while (my $q = shift @queue) {
+        my ($b, $j) = @$q;
+        for my $t (@targets) {
+            if (ref $t) { $consider->($_) for $j ? () : _swap($t, $b); next }
+            next if $j && $climb{$t} < $j;
+            $consider->($_) for ClaudeApart::Paths::candidate_spellings($t, [$b], $set);
+        }
+    }
+    return (\@bases, \@holes);
 }
 
-# The cd/pushd/chdir targets in a text: a word, or [old, new] for `cd old new`.
-sub _cd_targets {
-    my ($ctx, $text, $depth) = @_;
+# The signature of a folder spelling (see _cd_dirs): for it and each parent
+# up to $U levels, the real path, or the spelling itself when a spelling
+# other than the real path lies in or holds a root.
+sub _sig {
+    my ($s, $U, $set, $memo) = @_;
+    my @parts;
+    my $p = $s;
+    for my $i (0 .. $U) {
+        $memo->{$p} //= do {
+            my $c = ClaudeApart::Paths::canon($p, '/');
+            ClaudeApart::Paths::str_related($set, grep { $_ ne $c } ClaudeApart::Paths::spellings_abs($p))
+                ? 'L' . ClaudeApart::Paths::fold($p) : 'C' . ClaudeApart::Paths::fold($c);
+        };
+        push @parts, $memo->{$p};
+        last if $p eq '/';
+        $p =~ s{/[^/]*\z}{};
+        $p = '/' if $p eq '';
+    }
+    return join "\0", @parts;
+}
+
+# Is the first missing folder of $s (below the existing folder $e) a root,
+# or does it hold one?
+sub _missing_root {
+    my ($set, $e, $s) = @_;
+    my ($first) = substr($s, length($e eq '/' ? '' : $e) + 1) =~ m{\A([^/]+)};
+    return 0 unless defined $first;
+    my $f = ClaudeApart::Paths::fold(($e eq '/' ? '' : $e) . "/$first");
+    for my $r (@{ $set->{abs} }) { return 1 if $r eq $f || index($r, "$f/") == 0 }
+    for my $r (@{ $set->{fam} }) { return 1 if $r eq $f || index($r, "$f/") == 0 || index($f, "$r.") == 0 }
+    return 0;
+}
+
+# Finds cd/pushd/chdir words (also glued after "=", as in `c='cd ~'` or
+# `alias h='cd ~'`) and CDPATH assignments in a text, at every quoting depth.
+# Fills $out: targets (strings), swaps ([old, new] for zsh's `cd old new`),
+# cdpath (entries), climb (the most ".." of any word seen).
+my $CD_WORD = qr/(?:\A|=)(?:cd|pushd|chdir)\z/;
+my $CDPATH_SET = qr/\A(?:CDPATH|cdpath)\+?=/;
+
+sub _cd_scan {
+    my ($text, $depth, $out) = @_;
     my @tok = ClaudeApart::Paths::shell_words($text);
-    my @out;
     for my $i (0 .. $#tok) {
         my ($w, $op) = @{ $tok[$i] };
         next if $op;
-        push @out, _cd_targets($ctx, $w, $depth + 1) if $depth < $MAX_DEPTH && $w =~ $CODE;
-        next unless $w =~ /\A(?:cd|pushd|chdir)\z/;
-        my @a;
-        for (my $j = $i + 1; $j <= $#tok && !$tok[$j][1]; $j++) { push @a, $tok[$j][0] }
-        shift @a while @a && $a[0] =~ /\A(?:--|-[LPqe@]+)\z/;
-        if (!@a) { push @out, '~' unless $w eq 'pushd'; next }
-        next if $a[0] =~ /\A[-+]|`|OLDPWD|\A~[-+]/
-             || ClaudeApart::Paths::expand($a[0], $ctx->{cwd}) =~ /\$/;
-        push @out, $a[0];
-        push @out, [ @a[ 0, 1 ] ] if @a > 1;
+        my $c = ClaudeApart::Paths::climb_ub($w);
+        $out->{climb} = $c if $c > $out->{climb};
+        _cd_scan($w, $depth + 1, $out) if _nested($w, $depth);
+        if ($w =~ $CDPATH_SET) {
+            my $v = substr($w, $+[0]);
+            if (!length $v && $i < $#tok && $tok[ $i + 1 ][1] && $tok[ $i + 1 ][0] =~ /\A\(/) {    # cdpath=(a b)
+                for (my $j = $i + 2; $j <= $#tok && !$tok[$j][1]; $j++) { push @{ $out->{cdpath} }, $tok[$j][0] }
+            } else {
+                push @{ $out->{cdpath} }, split(/:/, $v);
+            }
+        }
+        next unless $w =~ $CD_WORD;
+        my ($args, $bare) = _cd_args(\@tok, $i + 1);
+        push @{ $out->{targets} }, '~' if $bare && $w !~ /pushd\z/;    # a bare pushd swaps two old folders
+        push @{ $out->{targets} }, map { _cd_forms($_) } @$args;
+        push @{ $out->{swaps} }, [ @$args[ 0, 1 ] ] if @$args > 1;
     }
-    return @out;
+}
+
+# The words after a cd: every word up to a list operator (; & && | ||
+# newline ( ) `), without redirections and their targets and without the
+# leading options (-L -P -q -e -s -@, --). A `}` word ends them (zsh `{ cd }`).
+# $bare: the cd may have no argument at all, so it goes home: no words, a
+# first word starting with # (a comment), or only words that may be the fd
+# number of a redirection (`cd 2>/dev/null`).
+sub _cd_args {
+    my ($tok, $j) = @_;
+    my (@a, $redir);
+    my ($opts, $fd) = (1, 0);
+    for (; $j < @$tok; $j++) {
+        my ($x, $op) = @{ $tok->[$j] };
+        if ($op) {
+            (my $rest = $x) =~ s/&?[<>]+[&|]?//g;
+            last if length $rest;
+            $fd++ if @a && $tok->[ $j - 1 ][1] == 0 && $a[-1] eq $tok->[ $j - 1 ][0] && $a[-1] =~ /\A(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})\z/;
+            $redir = 1;
+            next;
+        }
+        if ($redir) { $redir = 0; next }
+        next unless length $x;
+        last if $x eq '}';
+        if ($opts) {
+            if ($x eq '--') { $opts = 0; next }
+            next if $x =~ /\A-[LPqes@]+\z/;
+            $opts = 0;
+        }
+        push @a, $x;
+    }
+    my $bare = !@a || $a[0] =~ /\A#/ || $fd >= @a;
+    return (\@a, $bare);
+}
+
+# The targets one cd argument stands for. `-` is $OLDPWD; ~+, ~-, $PWD and
+# $OLDPWD followed by a rest stand for that rest taken from every folder
+# (and ~-/$OLDPWD also from $OLDPWD of the environment). Dir stack entries
+# (+N, -N), backticks and unknown variables add nothing: they go back to
+# folders already counted.
+sub _cd_forms {
+    my ($x) = @_;
+    my $old = $ENV{OLDPWD};
+    $old = undef unless defined $old && substr($old, 0, 1) eq '/';
+    if ($x eq '-') { return defined $old ? ($old) : () }
+    return () if $x =~ /\A[-+][0-9]+\z/ || index($x, '`') >= 0;
+    my $rest = ClaudeApart::Paths::prefix_rest($x);
+    if (defined $rest) {
+        my @f = $rest eq '.' ? () : ($rest);
+        push @f, "$old/$rest" if defined $old && $x =~ /\A(?:~-|\$\{?OLDPWD)/;
+        return @f;
+    }
+    return () if ClaudeApart::Paths::expand($x, '/') =~ /\$/;
+    return ($x);
 }
 
 sub _swap {
@@ -358,7 +524,7 @@ sub _read_only {
 sub _rule_recursive_reader {
     my ($ctx, $sh) = @_;
     for my $seg (@{ $sh->{segments} }) {
-        my $r = _find_cmd($seg, \&_is_reader) or next;
+        my $r = _find_cmd($seg, \&_is_reader, \%READER_NAME) or next;
         my @w = (@{ $r->{before} }, @{ _not_patterns($r->{name}, $r->{rest}) });
         return 1 if ClaudeApart::Paths::set_inside($ctx->{read}, map { @{ $_->{sp} } } @w);
         next unless $CWD_DEFAULT{ $r->{name} };
@@ -373,7 +539,7 @@ sub _rule_recursive_reader {
 sub _rule_recursive_modifier {
     my ($ctx, $sh) = @_;
     for my $seg (@{ $sh->{segments} }) {
-        my $m = _find_cmd($seg, \&_is_modifier) or next;
+        my $m = _find_cmd($seg, \&_is_modifier, \%MODIFIER_NAME) or next;
         my $w = _not_patterns($m->{name}, $m->{rest});
         return 1 if ClaudeApart::Paths::set_inside($ctx->{write}, map { @{ $_->{sp} } } @$w);
         next unless $m->{name} eq 'find' && !_has_real_path('find', $m->{rest});
@@ -400,13 +566,13 @@ sub _not_patterns {
 }
 
 # The first word of a segment that the test accepts, with the items up to it
-# (before) and after it (rest).
+# (before) and after it (rest). Only words named in %$names are tried.
 sub _find_cmd {
-    my ($seg, $test) = @_;
+    my ($seg, $test, $names) = @_;
     my @items = @{ $seg->{words} };
     for my $k (0 .. $#items) {
         my $name = _name($items[$k]{w});
-        next unless defined $name;
+        next unless defined $name && $names->{$name};
         my @rest = @items[ $k + 1 .. $#items ];
         return { name => $name, before => [ @items[ 0 .. $k ] ], rest => \@rest }
             if $test->($name, [ map { $_->{w} } @rest ]);

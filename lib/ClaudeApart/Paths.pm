@@ -22,7 +22,18 @@ my $PIECES     = qr/[=,:@]+/;                         # a=b, a,b, url:path, @fil
 my $FOLD       = $^O eq 'darwin';                     # macOS: names match in any case
 my $DATA       = '/System/Volumes/Data';              # macOS firmlink spelling
 
-my (%LINK, %SPELL, %ID, %GLOB);    # caches; one hook call is one process
+my (%LINK, %SPELL, %ID, %GLOB, %ISDIR, %LST, %PW);    # caches; one hook call is one process
+
+# A path component that stands for "some folder that does not exist yet"
+# (see Guard::_cd_dirs). Nobody has a folder with this name.
+our $HOLE = "\x01capart-missing\x01";
+
+# The home folder of a user name, from the password database, or undef.
+# A code ref so tests can stub it.
+our $USER_HOME = sub {
+    my @pw = getpwnam($_[0]);
+    return (@pw && defined $pw[7] && substr($pw[7], 0, 1) eq '/') ? $pw[7] : undef;
+};
 
 sub uniq { my %s; return grep { !$s{$_}++ } @_ }
 
@@ -35,21 +46,39 @@ sub home {
     return $h;
 }
 
-# Expands a leading ~, $HOME or ${HOME}. Any other leading $VAR / ${VAR} is
-# taken from the environment ($PWD = the given cwd), so `$XDG_CONFIG_HOME/…`
-# is caught too, and so are ${VAR:-word} style defaults:
-# `${XDG_CONFIG_HOME:-$HOME/.config}/…`.
+# Expands a leading ~, ~user (password database), $HOME or ${HOME}. ~+ and
+# $PWD are the given cwd; ~- and $OLDPWD are $OLDPWD from the environment,
+# else the cwd. Any other leading $VAR / ${VAR} is taken from the
+# environment, so `$XDG_CONFIG_HOME/…` is caught too, and so are
+# ${VAR:-word} style defaults: `${XDG_CONFIG_HOME:-$HOME/.config}/…`.
 my $NAME = qr/[A-Za-z_][A-Za-z0-9_]*/;
+
+sub _oldpwd {
+    my $o = $ENV{OLDPWD};
+    return (defined $o && substr($o, 0, 1) eq '/') ? $o : undef;
+}
 
 sub _var {
     my ($name, $cwd) = @_;
-    my $v = $name eq 'HOME' ? home() : ($name eq 'PWD' && defined $cwd) ? $cwd : $ENV{$name};
+    my $v = $name eq 'HOME' ? home()
+          : ($name eq 'PWD' && defined $cwd) ? $cwd
+          : $name eq 'OLDPWD' ? (_oldpwd() // $cwd)
+          : $ENV{$name};
     return (defined $v && length $v) ? $v : undef;
 }
 
 sub expand {
     my ($p, $cwd, $depth) = @_;
     return home() . substr($p, 1) if $p =~ m{^~(?=/|\z)};
+    if ($p =~ m{^~([-+])(?=/|\z)}) {
+        my $v = $1 eq '+' ? $cwd : (_oldpwd() // $cwd);
+        return defined $v ? $v . substr($p, 2) : $p;
+    }
+    if ($p =~ m{^~([A-Za-z0-9_][A-Za-z0-9._-]*)(?=/|\z)}) {
+        my ($name, $len) = ($1, $+[0]);
+        my $h = exists $PW{$name} ? $PW{$name} : ($PW{$name} = $USER_HOME->($name));
+        return defined $h ? $h . substr($p, $len) : $p;
+    }
     return $p if ($depth || 0) > 4;
     my ($name, $op, $word, $len);
     if ($p =~ m{^\$($NAME)(?=/|\z)}) {
@@ -157,6 +186,7 @@ sub exists_any {
 }
 
 sub _fold { return $FOLD ? lc $_[0] : $_[0] }
+sub fold  { return _fold($_[0]) }
 
 sub _under_str {    # both sides already folded
     my ($a, $r) = @_;
@@ -292,6 +322,27 @@ sub set_inside {
 # Shell words with quotes and backslashes removed, as [text, is_operator].
 # Runs of ; & | ( ) < > ` are operator tokens; an unquoted newline is the
 # operator "\n".
+# A backslash before a newline joins the lines. $'…' is decoded (ANSI-C
+# escapes); $"…" counts as "…".
+my %CESC = (a => "\a", b => "\b", e => "\e", E => "\e", f => "\f", n => "\n", r => "\r",
+            t => "\t", v => "\x0b");
+
+sub _ansi_c {
+    my ($q) = @_;
+    $q =~ s{\\(?:([abeEfnrtv])|([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|c(.)|(.))}{
+        defined $1 ? $CESC{$1}
+      : defined $2 ? chr(oct($2) & 255)
+      : defined $3 ? chr(hex $3)
+      : defined $4 ? _utf8(hex $4)
+      : defined $5 ? _utf8(hex $5)
+      : defined $6 ? chr(ord(uc $6) ^ 64)
+      : $7
+    }gse;
+    return $q;
+}
+
+sub _utf8 { my $c = $_[0] > 0x10FFFF ? 0xFFFD : $_[0]; my $s = chr($c); utf8::encode($s); return $s }
+
 sub shell_words {
     my ($s) = @_;
     my @w;
@@ -301,15 +352,17 @@ sub shell_words {
     while (pos($s) < length $s) {
         if ($s =~ /\G([ \t\n\r\f\x0b]+)/gc) { $flush->(); push @w, [ "\n", 1 ] if index($1, "\n") >= 0 }
         elsif ($s =~ /\G([;&|()<>`]+)/gc) { $flush->(); push @w, [ $1, 1 ] }
-        elsif ($s =~ /\G\\(.)/gcs) { $cur .= $1 unless $1 eq "\n"; $have = 1 }
+        elsif ($s =~ /\G\\\n/gc) { }
+        elsif ($s =~ /\G\\(.)/gcs) { $cur .= $1; $have = 1 }
+        elsif ($s =~ /\G\$'((?:[^'\\]+|\\.)*)'?/gcs) { $cur .= _ansi_c($1); $have = 1 }
         elsif ($s =~ /\G'([^']*)'?/gc) { $cur .= $1; $have = 1 }
-        elsif ($s =~ /\G"((?:[^"\\]+|\\.)*)"?/gcs) {
+        elsif ($s =~ /\G\$?"((?:[^"\\]+|\\.)*)"?/gcs) {
             my $q = $1;
             $q =~ s/\\([\$`"\\\n])/$1 eq "\n" ? '' : $1/ge;
             $cur .= $q;
             $have = 1;
         }
-        elsif ($s =~ /\G([^ \t\n\r\f\x0b;&|()<>`\\'"]+)/gc) { $cur .= $1; $have = 1 }
+        elsif ($s =~ /\G((?:[^ \t\n\r\f\x0b;&|()<>`\\'"\$]+|\$(?!['"]))+)/gc) { $cur .= $1; $have = 1 }
         else { $s =~ /\G(.)/gcs; $cur .= $1; $have = 1 }
     }
     $flush->();
@@ -363,12 +416,182 @@ sub glob_paths {
 # under that directory count as matched). A glob with no "/" (`*.md`) is often
 # a pattern, not a path, so it adds no directory; the guard checks the folder
 # a command runs in for those itself.
+#
+# A word that starts with ~+, ~-, $PWD or $OLDPWD names a place relative to
+# the folder the shell is in, so its rest is also taken from each base.
+# A word that does not depend on the base is resolved once.
+# $plain (optional): bases that neither lie in nor hold a root of $gate (see
+# plain_dir). From such a base, a simple relative word whose first part does
+# not exist cannot reach a root (no symlink on the way, no root below the
+# base), so it is skipped there. This keeps long texts fast when a command
+# has many cd targets.
 sub _dotdot_glob { return $_[0] =~ /\A\.\.?[*?\[{]/ }    # can this part match ".."?
 
+# Upper bound of how many folders a word climbs: its ".." parts (between
+# / = , : @), counting a part that may match ".." (.* .? .[ ..*) as one too.
+# A word with a brace group counts every ".." and ".*"-like text in it.
+sub climb_ub {
+    my ($w) = @_;
+    return scalar(() = $w =~ /\.\.|\.[*?\[{]/g) if index($w, '{') >= 0;
+    return scalar grep { $_ eq '..' || _dotdot_glob($_) } split m{[/=,:@]+}, $w;
+}
+
+sub prefix_rest {
+    my ($c) = @_;
+    return undef unless $c =~ m{\A(?:~[-+]|\$\{(?:OLD)?PWD\}|\$(?:OLD)?PWD(?![A-Za-z0-9_]))(?=/|\z)/*};
+    my $r = substr($c, $+[0]);
+    return length $r ? $r : '.';
+}
+
+sub _isdir { my ($p) = @_; return exists $ISDIR{$p} ? $ISDIR{$p} : ($ISDIR{$p} = -d $p ? 1 : 0) }
+# '' (missing), 'l' (symlink), 'd' (directory) or 'f' (anything else); not following a last symlink.
+sub _ltype {
+    my ($p) = @_;
+    return $LST{$p} if exists $LST{$p};
+    return $LST{$p} = !(lstat $p) ? '' : -l _ ? 'l' : -d _ ? 'd' : 'f';
+}
+
+# Walking down from the real folder $pre ('' is /) through @$names: does
+# the walk reach a name that does not exist while every folder on the way
+# is a real directory (no symlink) that neither lies in nor holds a root of
+# $gate? Then the path cannot reach a root.
+sub _unreachable {
+    my ($gate, $pre, $names) = @_;
+    my $cur = $pre;
+    for my $n (@$names) {
+        return 0 unless plain_dir($gate, length $cur ? $cur : '/');
+        my $t = _ltype("$cur/$n");
+        return 1 if $t eq '';
+        return 0 unless $t eq 'd';
+        $cur .= "/$n";
+    }
+    return 0;
+}
+
+# The longest prefix of an absolute path that is an existing directory, and
+# how many parts come after it.
+sub dir_prefix {
+    my ($p) = @_;
+    my $k = 0;
+    while ($p ne '/' && !_isdir($p)) {
+        $p =~ s{/[^/]*\z}{};
+        $p = '/' if $p eq '';
+        $k++;
+    }
+    return ($p, $k);
+}
+
+# Is one of these spellings inside a root of the set, or a root inside it,
+# comparing text only?
+sub str_related {
+    my ($set, @spellings) = @_;
+    for my $a (@spellings) {
+        my $f = _fold($a);
+        for my $r (@{ $set->{abs} }) { return 1 if _under_str($f, $r) || _under_str($r, $f) }
+        for my $b (@{ $set->{fam} }) { return 1 if index($f, "$b.") == 0 || _under_str($b, $f) }
+    }
+    return 0;
+}
+
+# A folder that neither lies in nor holds a root of the set, by text or by
+# inode, in any spelling.
+sub plain_dir {
+    my ($set, $d) = @_;
+    my $m = $set->{plain} ||= {};
+    return $m->{$d} if exists $m->{$d};
+    my @sp = spellings_abs($d);
+    return $m->{$d} = (str_related($set, @sp) || set_holds($set, @sp) || set_inside($set, @sp)) ? 0 : 1;
+}
+
+my %CANON;    # is a folder spelled as its real path (no symlink in it)?
+sub _is_canon { my ($b) = @_; return $CANON{$b} //= (canon($b, "/") eq $b ? 1 : 0) }
+
+sub _anc {    # $p climbed $n folders up
+    my ($p, $n) = @_;
+    while ($n-- > 0 && $p ne "/") { $p =~ s{/[^/]*\z}{}; $p = "/" if $p eq "" }
+    return $p;
+}
+
+# Brace expansion, which the shell does before ~ and $ expansion:
+# "a{b,c}d" gives "abd" and "acd" (nested groups too). Only a group with a
+# comma at its top level expands; ${…} is a variable, not a group. More than
+# $BRACE_CAP words is an error.
+my $BRACE_CAP = 256;
+
+sub _brace_group {    # (before, [alternatives], after) of the first group, or ()
+    my ($s) = @_;
+    my $n = length $s;
+    for (my $i = 0; $i < $n; $i++) {
+        my $ch = substr($s, $i, 1);
+        if ($ch eq '\\') { $i++; next }
+        next unless $ch eq '{';
+        my $var = $i > 0 && substr($s, $i - 1, 1) eq '$';
+        my ($depth, $start, @alts) = (0, $i + 1);
+        for (my $j = $i; $j < $n; $j++) {
+            my $d = substr($s, $j, 1);
+            if    ($d eq '\\') { $j++ }
+            elsif ($d eq '{') { $depth++ }
+            elsif ($d eq ',' && $depth == 1) { push @alts, substr($s, $start, $j - $start); $start = $j + 1 }
+            elsif ($d eq '}' && --$depth == 0) {
+                last if $var || !@alts;    # ${…} or no comma: not a group; look further on
+                push @alts, substr($s, $start, $j - $start);
+                return (substr($s, 0, $i), \@alts, substr($s, $j + 1));
+            }
+        }
+    }
+    return ();
+}
+
+sub brace_alts {
+    my ($w) = @_;
+    return ($w) unless index($w, '{') >= 0 && index($w, ',') >= 0;
+    my (@out, @todo);
+    @todo = ($w);
+    while (@todo) {
+        my $s = shift @todo;
+        my ($pre, $alts, $post) = _brace_group($s);
+        if (!defined $pre) { push @out, $s; next }
+        push @todo, map { "$pre$_$post" } @$alts;
+        die "too many brace expansions\n" if @out + @todo > $BRACE_CAP;
+    }
+    return uniq(@out);
+}
+
 sub candidate_spellings {
-    my ($c, $bases, $gate) = @_;
+    my ($c, $bases, $gate, $fast) = @_;
     my @out;
-    for my $b (@$bases) {
+    my @alts = brace_alts($c);
+    if (@alts > 1 || $alts[0] ne $c) { push @out, candidate_spellings($_, $bases, $gate, $fast) for @alts }
+    my $rest = prefix_rest($c);
+    push @out, candidate_spellings($rest, $bases, $gate, $fast) if defined $rest && $rest ne $c;
+    my $x = expand($c, "\x02");
+    my @bases = (substr($x, 0, 1) eq '/' && index($x, "\x02") < 0) ? ($bases->[0]) : @$bases;
+    # Fast path ($fast, needs $gate): a relative word made of leading . and ..
+    # parts and then plain names ($tail). From a base with no symlink in it,
+    # the kernel and the text agree on where the leading .. parts go, so the
+    # word's spellings are those of "<that folder>/<tail>" (shared by every
+    # base that climbs to the same folder). If that folder neither lies in
+    # nor holds a root of $gate and the first name of the tail does not exist
+    # there, nothing can be reached: no symlink on the way, no root below.
+    my ($up, $tail);
+    if ($fast && $gate && !defined $rest && $c !~ m{\A[~\$]} && $c !~ $GLOB_CHARS
+        && $c =~ m{\A((?:\.\.?(?:/+|\z))*)(.*)\z}s) {
+        my ($lead, $t) = ($1, $2);
+        if (substr($c, 0, 1) ne '/' && $t !~ m{(?:\A|/)\.\.?(?:/|\z)}) {
+            $up = () = $lead =~ /\.\./g;
+            ($tail = $t) =~ s{/+\z}{};
+        }
+    }
+    my @names = defined $tail ? split(m{/+}, $tail) : ();
+    for my $b (@bases) {
+        if (defined $up && _is_canon($b)) {
+            my $a = _anc($b, $up);
+            if (!@names) { push @out, spellings_abs($a); next }
+            my $pre = $a eq '/' ? '' : $a;
+            next if _unreachable($gate, $pre, \@names);
+            push @out, spellings_abs("$pre/$tail");
+            next;
+        }
         my $abs = absolute($c, $b);
         push @out, spellings_abs($abs);
         (my $g = $abs) =~ s/\{\}//g;                    # "{}" is literal in a shell (find -exec)

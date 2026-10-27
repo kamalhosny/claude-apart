@@ -17,6 +17,7 @@ t_setup() {
   export PATH="$T/bin:$REPO/bin:/usr/bin:/bin"
   unset CLAUDE_CONFIG_DIR CLAUDE_APART_PROFILE CLAUDE_CODE_CHILD_SESSION CLAUDECODE
   unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  unset CDPATH OLDPWD   # the guard reads both; a later cd sets OLDPWD again, not exported
   local v
   for v in $(env | sed -n 's/^\(HERDR_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
   unset HERDR_ENV HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_PANE_ID HERDR_SOCKET

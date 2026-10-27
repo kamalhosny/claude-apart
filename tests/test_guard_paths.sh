@@ -560,9 +560,191 @@ test_cd_targets() {
   _sh work 'cd a; cd b; cd c; cd d; cd e; cd ../../../../../..; cat .claude/x' "$HOME/repo"
   _blocked "chain of cd ends at home" || return 1
   local i many=''
-  for i in $(seq 1 70); do many="${many}cd /tmp/ca-none-$i; "; done
+  for i in $(seq 1 70); do mkdir -p "$T/many/d$i"; many="${many}cd $T/many/d$i; "; done
   _sh work "$many" "$HOME/repo"
   _guard_error "more than 64 cd folders" || return 1
+}
+
+# ---- fix round 4: cd targets, bases, nesting, ~user, CDPATH, time ----------
+
+test_cd_target_words() { # every word after a cd counts, past redirects, options and comments
+  t_two_profiles
+  mkdir -p "$HOME/repo/sub" "$HOME/repo/a/b"
+  local c nl=$'\n'
+  for c in 'cd 2>/dev/null ~; cat .claude/x' 'cd 2>&1 ~ && cat .claude/x' 'pushd >/dev/null ~; cat .claude/x' \
+           'cd 2>/dev/null; cat .claude/x' "cd >/dev/null / && cat ${HOME#/}/.claude/x" \
+           "cd \\${nl}  ~ && cat .claude/x" "cd \\${nl}&& cat .claude/x" "cd # back home${nl}cat .claude/x" \
+           'cd -s ~ && cat .claude/x' 'cd -s; cat .claude/x' 'cd -qP ~ && cat .claude/x' "\$'cd' ~; cat .claude/x" \
+           "\$'\\x63d' ~; cat .claude/x" '$"cd" ~; cat .claude/x' '{ cd }; cat .claude/x' \
+           "c='cd ~'; eval \"\$c\"; cat .claude/x" "alias h='cd ~'${nl}h${nl}cat .claude/x" \
+           'cd ~+/.. && cat .claude/x' 'cd sub; cd "$OLDPWD/.." && cat .claude/x' \
+           'cd sub; cd ${OLDPWD}/.. && cat .claude/x'; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "cwd repo: $c" || return 1
+  done
+  _sh work 'cd ~/repo/a/b; cd /; cd ~-/../../.. && cat .claude/x' "$HOME/repo/a"
+  _blocked "~- with a rest climbs from every folder" || return 1
+  _sh work 'cd ~/repo && cd "$PWD/.." && cat .claude/x' "$HOME/repo/a/b"
+  _blocked '$PWD with a rest climbs from every folder' || return 1
+  OLDPWD=$HOME _sh work 'cd - && cat .claude/x' "$HOME/repo"
+  _blocked 'cd - goes to $OLDPWD of the environment' || return 1
+  OLDPWD=$HOME _sh work 'cat ~-/.claude/x' "$HOME/repo"
+  _blocked '~- in a word is $OLDPWD of the environment' || return 1
+  _sh work 'cd ~; cd ~/repo; cat ~-/.claude/x' "$HOME/repo"
+  _blocked '~- in a word is any folder of the command' || return 1
+  _sh work 'cat ~+/.claude/x' "$HOME"
+  _blocked '~+ in a word is the folder the shell is in' || return 1
+  for c in 'cd {~,x} && cat .claude/x' 'cd {/tmp,{~,y}} && cat .claude/x' 'cat {~,x}/.claude/x' \
+           'cat {~,~}/.claude/x' 'cat ~/.cla{u,x}de/x'; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "brace expansion comes before ~: $c" || return 1
+  done
+  _paths 'print join " ", ClaudeApart::Paths::brace_alts($ARGV[0])' 'a{b,c{d,e}}f${X:-1,2}{}'
+  assert_eq 'abf${X:-1,2}{} acdf${X:-1,2}{} acef${X:-1,2}{}' "$OUT" "brace groups, not \${…} or {}" || return 1
+  for c in 'cd sub 2>/dev/null && cat .claude/x' 'cd sub >/dev/null; cat .claude/x' \
+           'pushd sub >/dev/null && cat .claude/x && popd' 'cd -- sub && cat .claude/x' \
+           "cd sub # go in${nl}cat .claude/x" 'cd -P sub && cat .claude/x'; do
+    _sh work "$c" "$HOME/repo"
+    _allowed "cwd repo: $c" || return 1
+  done
+}
+
+test_cd_bases_every_spelling() { # symlink spellings and missing folders stay bases
+  t_two_profiles
+  mkdir -p "$HOME/repo/sub"
+  ln -s . "$HOME/repo/l"
+  _sh work 'cd l && cd ../.. && cat .claude/x' "$HOME/repo"
+  _blocked "a symlink spelling is a base" || return 1
+  local c
+  for c in 'mkdir -p ~/x/y/z/w && cd ~/x/y/z && cd w && cat ../../../../.claude/q' \
+           'mkdir -p ~/zz/a/b && cd ~/zz/a/b && cd .. && cd .. && cat ../.claude/x' \
+           'mkdir -p n/m && cd n && cd m && cat ../../../.claude/x' \
+           'mkdir -p ~/q/r && cd ~/q/r && cd ../.. && cat .claude/x'; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "a missing folder stays a base: $c" || return 1
+  done
+  ln -s . "$HOME/repo/sub/self"; ln -s .. "$HOME/repo/sub/up"
+  ln -s loop2 "$HOME/repo/loop1"; ln -s loop1 "$HOME/repo/loop2"
+  for c in 'cd sub/self; cd self; cd self/self; cd up; cd up/sub; cd loop1; cd loop2; make' \
+           'cd l; cd l; cd l/l; cd ..; make' 'cd n1; cd n2; cd n3; cd ../..; make' \
+           'mkdir -p b/c && cd b/c && cmake ../..'; do
+    _sh work "$c" "$HOME/repo"
+    _allowed "stays small: $c" || return 1
+  done
+  rmdir "$HOME/.claude"
+  _sh work 'CDPATH=~ cd .claude/projects && cat ../x' "$HOME/repo"
+  _blocked "a missing root is kept as written" || return 1
+}
+
+_deep_cd='bash -c "bash -c '"'"'bash -c \"eval cd\\ ~\"'"'"'"; cat .claude/x'
+
+test_cd_nesting_too_deep() { # code nested past the depth limit is a guard error, not a pass
+  t_two_profiles
+  mkdir -p "$HOME/repo/sub"
+  _sh work "$_deep_cd" "$HOME/repo"
+  _guard_error "cd nested past the depth limit" || return 1
+  _sh work 'bash -c "bash -c '"'"'bash -c \"eval cat\\ x\"'"'"'"' "$HOME/repo"
+  _guard_error "any code nested past the depth limit" || return 1
+  _sh work "bash -c \"bash -c 'cd sub && make'\"" "$HOME/repo"
+  _allowed "nesting within the limit" || return 1
+  local nl=$'\n'
+  _sh work "git commit -m \"\$(cat <<'EOF'${nl}fix: it's done${nl}${nl}Body with \"quotes\" and 'more'.${nl}EOF${nl})\"" "$HOME/repo"
+  _allowed "a commit message heredoc" || return 1
+  run perl -I"$REPO/lib" -MClaudeApart::Guard -MClaudeApart::Config -e '
+    my $cfg = ClaudeApart::Config::load(ClaudeApart::Config::config_path());
+    my $ctx = ClaudeApart::Guard::_context($cfg, "work", "$ENV{HOME}/repo");
+    my $sh = { dirs => ["$ENV{HOME}/repo"], holes => [], memo => {}, plain => {}, segments => [] };
+    eval { ClaudeApart::Guard::_walk($ctx, $sh, q{eval "cd ~"}, 3, 1); 1 } ? print "pass" : print "died"'
+  assert_eq died "$OUT" "_walk dies past the depth limit" || return 1
+}
+
+_stub_verdict() { # <tool> <json input> <cwd>: verdict with getpwnam("someone") stubbed to $HOME
+  run perl -I"$REPO/lib" -MJSON::PP -MClaudeApart::Guard -MClaudeApart::Config -e '
+    $ClaudeApart::Paths::USER_HOME = sub { $_[0] eq "someone" ? $ENV{HOME} : undef };
+    my $cfg = ClaudeApart::Config::load(ClaudeApart::Config::config_path());
+    my $v = ClaudeApart::Guard::verdict($cfg, "work", $ARGV[0], decode_json($ARGV[1]), $ARGV[2]);
+    print $v ? "block" : "allow"' "$1" "$2" "$3"
+}
+
+test_tilde_user() { # ~user expands through the password database
+  t_two_profiles
+  mkdir -p "$HOME/repo"
+  local me want c
+  me=$(id -un)
+  want=$(perl -e 'print((getpwnam($ARGV[0]))[7])' "$me")
+  _paths 'print ClaudeApart::Paths::expand($ARGV[0], "/")' "~$me/x"
+  assert_eq "$want/x" "$OUT" "~user is the home from getpwnam, not \$HOME" || return 1
+  _paths 'print ClaudeApart::Paths::expand($ARGV[0], "/")' '~capart-no-such-user-zz/x'
+  assert_eq '~capart-no-such-user-zz/x' "$OUT" "an unknown user stays literal" || return 1
+  _paths '$ClaudeApart::Paths::USER_HOME = sub { $_[0] eq "someone" ? "/u/someone" : undef };
+          print ClaudeApart::Paths::expand($ARGV[0], "/")' '~someone/a/b'
+  assert_eq /u/someone/a/b "$OUT" "stubbed getpwnam" || return 1
+  for c in 'cat ~someone/.claude/x' 'cd ~someone && cat .claude/x' 'grep -r foo ~someone' \
+           'cd ~someone/repo && cat ../.claude/x'; do
+    _stub_verdict Bash "{\"command\":$(_json_str "$c")}" "$HOME/repo"
+    assert_eq block "$OUT" "stubbed ~someone = HOME: $c" || return 1
+  done
+  _stub_verdict Read "{\"file_path\":\"~someone/.claude/x\"}" "$HOME/repo"
+  assert_eq block "$OUT" "Read tool with ~someone" || return 1
+  _stub_verdict Bash '{"command":"cat ~someone/notes.txt; cat ~other/.claude/x"}' "$HOME/repo"
+  assert_eq allow "$OUT" "other paths and unknown users" || return 1
+}
+
+test_cdpath() { # a relative cd target is also taken from every CDPATH entry
+  t_two_profiles
+  mkdir -p "$HOME/repo/sub"
+  echo s > "$HOME/.claude/settings.json"
+  local c
+  for c in 'CDPATH=~ cd .claude && cat settings.json' 'export CDPATH=/tmp:~; cd .claude; cat settings.json' \
+           'CDPATH="$HOME" cd .claude && cat settings.json' 'cdpath=(/tmp ~); cd .claude && cat settings.json' \
+           'CDPATH=..:/tmp cd .claude && cat settings.json' 'CDPATH=~ pushd .claude && cat settings.json'; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "cwd repo: $c" || return 1
+  done
+  CDPATH=$HOME _sh work 'cd .claude && cat settings.json' "$HOME/repo"
+  _blocked "CDPATH from the environment" || return 1
+  CDPATH=/tmp _sh work 'cd sub && cat .claude/x' "$HOME/repo"
+  _allowed "CDPATH somewhere else" || return 1
+  CDPATH=$HOME _sh work 'cd /tmp && cat .claude/x' "$HOME/repo/sub"
+  _allowed "an absolute target does not use CDPATH" || return 1
+}
+
+test_relative_word_skip_is_sound() { # the "first part missing" shortcut never hides a symlink or a root
+  t_two_profiles
+  mkdir -p "$HOME/repo/sub/deeper" "$HOME/repo/d1" "$HOME/repo/d2"
+  echo s > "$HOME/.claude/settings.json"
+  ln -s "$HOME/.claude" "$HOME/repo/pl"
+  ln -s "$HOME/.claude" "$HOME/repo/sub/deeper/pl"
+  ln -s "$HOME/.claude/not-yet" "$HOME/repo/dangling"
+  ln -s "$HOME/.claude" "$HOME/repo/d1/pl"
+  local c
+  for c in 'cat pl/settings.json' 'cat sub/deeper/pl/settings.json' 'cat dangling' 'cat ./pl/x' \
+           'cat ../.CLAUDE/x' 'cd d1; cd d2; cat pl/settings.json' 'cd d2; cat ../d1/pl/x' \
+           'cd sub/deeper; cat ../../pl/x' 'grep -r foo pl'; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "cwd repo: $c" || return 1
+  done
+  for c in 'cat src/x.rb lib/y.rb' 'cat sub/deeper/nothing/x' 'cd d1; cd d2; cat src/x ../src/y'; do
+    _sh work "$c" "$HOME/repo"
+    _allowed "cwd repo: $c" || return 1
+  done
+}
+
+test_cd_many_targets_time() { # repeated targets are counted once; many targets stay fast
+  t_two_profiles
+  mkdir -p "$HOME/repo/sub"
+  local j k big words nl=$'\n'
+  big=''; for j in $(seq 1 5000); do big="${big}cd ..; cd sub; "; done
+  _bounded_hook 20 work "$(_bash_json "$big" "$HOME/repo")"
+  _allowed "10000 cd words" || return 1
+  [ "$ELAPSED" -lt 2500 ] || { echo "10000 cd words took ${ELAPSED} ms"; return 1; }
+  for j in $(seq 1 40); do mkdir -p "$HOME/repo/d$j"; done
+  words=''; for k in $(seq 1 400); do words="$words src/file$k.rb lib/x$k.txt docs/*.md"; done
+  big="cat > notes.txt <<'EOF'${nl}"; for j in $(seq 1 40); do big="${big}cd d$j${nl}"; done
+  big="${big}cd ..${nl}${words}${nl}EOF"
+  _bounded_hook 20 work "$(_bash_json "$big" "$HOME/repo")"
+  _allowed "40 cd targets, cd .. and 1200 words" || return 1
+  [ "$ELAPSED" -lt 2500 ] || { echo "40 targets + 1200 words took ${ELAPSED} ms"; return 1; }
 }
 
 test_recursive_ancestor_blocked() {
