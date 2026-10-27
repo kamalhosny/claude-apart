@@ -36,6 +36,11 @@ my %PATH_KEY = map { $_ => 1 } qw(path paths dir directory root cwd file file_pa
 my $MAX_DEPTH = 3;      # quoted shell code inside quoted shell code …
 my $MAX_DIRS  = 64;     # folders a command may cd to
 my $CODE      = qr/[ \t\n\r\f\x0b;&|()<>`'"]/;    # a word that may hold shell code
+# A quoted word is surely shell code after `<shell> … -c` or after one of
+# %EVAL_NAME, or when it holds $(…) or backticks. Other quoted words are
+# only maybe code (a JSON body, a message): see _item.
+my %SHELL_NAME = map { $_ => 1 } qw(sh bash zsh dash ksh mksh ash yash posh busybox su runuser script flock);
+my %EVAL_NAME  = map { $_ => 1 } qw(eval trap watch alias);
 
 # Rules for a shell command, in order. Each gets ($ctx, $sh) and returns true
 # to block. $sh->{segments} holds the simple commands; see _analyse. Later
@@ -215,10 +220,11 @@ sub _walk {
     my ($words, $redirs, $want_target) = ([], [], 0);
     my $end = sub {
         return unless @$words || @$redirs;
+        my @code = _code_flags($words);
         push @{ $sh->{segments} }, {
             exec      => $exec,
-            words     => [ map { _item($ctx, $sh, $_, $depth, $exec) } @$words ],
-            redirects => [ map { _item($ctx, $sh, $_, $depth, $exec) } @$redirs ],
+            words     => [ map { _item($ctx, $sh, $words->[$_], $depth, $exec, $code[$_]) } 0 .. $#$words ],
+            redirects => [ map { _item($ctx, $sh, $_, $depth, $exec, 0) } @$redirs ],
         };
         ($words, $redirs) = ([], []);
     };
@@ -235,25 +241,45 @@ sub _walk {
     $end->();
 }
 
+# Code inside a word that is only maybe code: past the brace cap, a word
+# there is taken as written instead of being an error (R37).
 sub _item {
-    my ($ctx, $sh, $w, $depth, $exec) = @_;
+    my ($ctx, $sh, $w, $depth, $exec, $code) = @_;
     my @sp = map { _piece($ctx, $sh, $_) } ClaudeApart::Paths::word_pieces($w);
-    _walk($ctx, $sh, $w, $depth + 1, ($exec && $w =~ /\$\(|`/) ? 1 : 0) if _nested($w, $depth);
+    if (_nested($w, $depth)) {
+        local $ClaudeApart::Paths::BRACE_SOFT = ($code || $w =~ /\$\(|`/) ? 0 : 1;
+        _walk($ctx, $sh, $w, $depth + 1, ($exec && $w =~ /\$\(|`/) ? 1 : 0);
+    }
     return { w => $w, sp => [ ClaudeApart::Paths::uniq(@sp) ] };
+}
+
+# For each word of a simple command: is it surely shell code (see %SHELL_NAME)?
+sub _code_flags {
+    my ($words) = @_;
+    my ($shell, $code, @f) = (0, 0);
+    for my $w (@$words) {
+        push @f, $code;
+        my $n = _name($w) // '';
+        if    ($EVAL_NAME{$n})  { $code  = 1 }
+        elsif ($SHELL_NAME{$n}) { $shell = 1 }
+        elsif ($shell && $w =~ /\A-[A-Za-z]*c[A-Za-z]*\z/) { $code = 1 }
+    }
+    return @f;
 }
 
 # The spellings of one path piece, from every folder of the command.
 sub _piece {
     my ($ctx, $sh, $p) = @_;
     my $m = $sh->{memo};
-    return @{ $m->{$p} } if $m->{$p};
+    my $key = "$ClaudeApart::Paths::BRACE_SOFT\0" . ClaudeApart::Paths::brace_view($p);
+    return @{ $m->{$key} } if $m->{$key};
     my @sp = ClaudeApart::Paths::candidate_spellings($p, $sh->{dirs}, $ctx->{write}, 1);
     my $c = ClaudeApart::Paths::climb_ub($p);
     for my $h (@{ $sh->{holes} }) {
         push @sp, ClaudeApart::Paths::candidate_spellings($p, [ $h->[0] ], $ctx->{write}, 1) if $c >= $h->[1];
     }
-    $m->{$p} = [ ClaudeApart::Paths::uniq(@sp) ];
-    return @{ $m->{$p} };
+    $m->{$key} = [ ClaudeApart::Paths::uniq(@sp) ];
+    return @{ $m->{$key} };
 }
 
 # R8, union form: the folders a command may run in are the session cwd and
@@ -307,18 +333,22 @@ sub _cd_dirs {
     my $deep = 0;
     for (@{ $set->{abs} }, @{ $set->{fam} }) { my $d = tr{/}{}; $deep = $d if $d > $deep }
 
-    my (@bases, @holes, @queue, %sig, %part, %canon, %seen, %hole);
+    my @t_swaps = grep { ref } @targets;
+    my (@bases, @holes, @queue, @swap_from, %sig, %part, %canon, %seen, %hole, %is_base);
+    my $swapped = 0;
     my $base = sub {
         my ($s) = @_;
         return if $sig{ _sig($s, $U, $set, \%part) }++;
         push @bases, $s;
         push @queue, [ $s, 0 ];
+        $is_base{$s} = 1;
         $canon{ ClaudeApart::Paths::canon($s, '/') } = 1;
         die "too many cd directories\n" if keys %canon > $MAX_DIRS;
     };
     my $consider = sub {
         my ($s) = @_;
         return if $seen{$s}++ || index($s, $ClaudeApart::Paths::HOLE) >= 0;
+        push @swap_from, $s if @t_swaps;
         my ($e, $k) = ClaudeApart::Paths::dir_prefix($s);
         return $base->($s) unless $k;
         my $h = $e eq '/' ? '' : $e;
@@ -332,11 +362,26 @@ sub _cd_dirs {
         $base->($s) if _missing_root($set, $e, $s) && ($s =~ tr{/}{}) <= $deep + $U;
     };
     $base->($_) for @cwd;    # the session cwd counts even when it is missing
-    $seen{$_} = 1 for @cwd;
-    while (my $q = shift @queue) {
-        my ($b, $j) = @$q;
-        for my $t (@targets) {
-            if (ref $t) { $consider->($_) for $j ? () : _swap($t, $b); next }
+    $seen{$_} = $is_base{$_} = 1 for @cwd;
+    push @swap_from, @cwd if @t_swaps;
+    while (@queue || @swap_from) {
+        if (@swap_from) {
+            # zsh's `cd old new` edits the text of $PWD, which may be any
+            # spelling seen, also one dropped as a duplicate or a missing one.
+            # The result must be a folder that exists; from a base (or the
+            # cwd) a missing result is kept too, as it may be made first.
+            my $s = shift @swap_from;
+            for my $t (@t_swaps) {
+                for my $r (_swap($t, $s)) {
+                    next if $seen{$r} || !($is_base{$s} || ClaudeApart::Paths::isdir($r));
+                    die "too many cd directories\n" if ++$swapped > 16 * $MAX_DIRS;
+                    $consider->($r);
+                }
+            }
+            next;
+        }
+        my ($b, $j) = @{ shift @queue };
+        for my $t (@t) {
             next if $j && $climb{$t} < $j;
             $consider->($_) for ClaudeApart::Paths::candidate_spellings($t, [$b], $set);
         }

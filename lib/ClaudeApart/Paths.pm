@@ -1,6 +1,7 @@
 package ClaudeApart::Paths;
 use strict;
 use warnings;
+no warnings 'newline';    # words may end in a newline ($'a\n', "a<NL>"); stat on them just fails
 
 # Path helpers for the guard. Core Perl only.
 #
@@ -343,27 +344,58 @@ sub _ansi_c {
 
 sub _utf8 { my $c = $_[0] > 0x10FFFF ? 0xFFFD : $_[0]; my $s = chr($c); utf8::encode($s); return $s }
 
+#
+# R37: like bash, only braces outside quotes expand. For each word with a
+# brace or comma, shell_words remembers in %VIEW a "view" of the word in
+# which the quoted (or backslashed) { , } are swapped for the bytes \x1c
+# \x1d \x1e; brace_alts expands the view, so only the unquoted ones count.
+# The same text written both ways counts as unquoted (more is checked).
+# Code in quotes (bash -c '…') is parsed again one level deeper, where its
+# own unquoted braces expand.
+my %VIEW;
+
+sub _inert { (my $v = $_[0]) =~ tr/{,}/\x1c\x1d\x1e/; return $v }
+sub brace_view { return exists $VIEW{ $_[0] } ? $VIEW{ $_[0] } : $_[0] }
+
+sub _remember_view {
+    my ($w, $v) = @_;
+    return unless $w =~ /[{,}]/;
+    $v = $w if $w =~ /[\x1c-\x1e]/;    # cannot tell apart: all unquoted
+    my $old = $VIEW{$w};
+    if (defined $old && $old ne $v) {   # merge: a brace is unquoted if it is in either
+        my $m = $old;
+        for my $i (0 .. length($m) - 1) {
+            substr($m, $i, 1) = substr($w, $i, 1) if substr($v, $i, 1) eq substr($w, $i, 1);
+        }
+        $v = $m;
+    }
+    $VIEW{$w} = $v;
+}
+
 sub shell_words {
     my ($s) = @_;
     my @w;
-    my ($cur, $have) = ('', 0);
-    my $flush = sub { push @w, [ $cur, 0 ] if $have; ($cur, $have) = ('', 0) };
+    my ($cur, $view, $have) = ('', '', 0);
+    my $flush = sub {
+        if ($have) { push @w, [ $cur, 0 ]; _remember_view($cur, $view) }
+        ($cur, $view, $have) = ('', '', 0);
+    };
+    my $add = sub { $cur .= $_[0]; $view .= $_[1] ? _inert($_[0]) : $_[0]; $have = 1 };
     pos($s) = 0;
     while (pos($s) < length $s) {
         if ($s =~ /\G([ \t\n\r\f\x0b]+)/gc) { $flush->(); push @w, [ "\n", 1 ] if index($1, "\n") >= 0 }
         elsif ($s =~ /\G([;&|()<>`]+)/gc) { $flush->(); push @w, [ $1, 1 ] }
         elsif ($s =~ /\G\\\n/gc) { }
-        elsif ($s =~ /\G\\(.)/gcs) { $cur .= $1; $have = 1 }
-        elsif ($s =~ /\G\$'((?:[^'\\]+|\\.)*)'?/gcs) { $cur .= _ansi_c($1); $have = 1 }
-        elsif ($s =~ /\G'([^']*)'?/gc) { $cur .= $1; $have = 1 }
+        elsif ($s =~ /\G\\(.)/gcs) { $add->($1, 1) }
+        elsif ($s =~ /\G\$'((?:[^'\\]+|\\.)*)'?/gcs) { $add->(_ansi_c($1), 1) }
+        elsif ($s =~ /\G'([^']*)'?/gc) { $add->($1, 1) }
         elsif ($s =~ /\G\$?"((?:[^"\\]+|\\.)*)"?/gcs) {
             my $q = $1;
             $q =~ s/\\([\$`"\\\n])/$1 eq "\n" ? '' : $1/ge;
-            $cur .= $q;
-            $have = 1;
+            $add->($q, 1);
         }
-        elsif ($s =~ /\G((?:[^ \t\n\r\f\x0b;&|()<>`\\'"\$]+|\$(?!['"]))+)/gc) { $cur .= $1; $have = 1 }
-        else { $s =~ /\G(.)/gcs; $cur .= $1; $have = 1 }
+        elsif ($s =~ /\G((?:[^ \t\n\r\f\x0b;&|()<>`\\'"\$]+|\$(?!['"]))+)/gc) { $add->($1, 0) }
+        else { $s =~ /\G(.)/gcs; $add->($1, 0) }
     }
     $flush->();
     return @w;
@@ -444,6 +476,7 @@ sub prefix_rest {
 }
 
 sub _isdir { my ($p) = @_; return exists $ISDIR{$p} ? $ISDIR{$p} : ($ISDIR{$p} = -d $p ? 1 : 0) }
+sub isdir  { return _isdir($_[0]) }
 # '' (missing), 'l' (symlink), 'd' (directory) or 'f' (anything else); not following a last symlink.
 sub _ltype {
     my ($p) = @_;
@@ -515,8 +548,11 @@ sub _anc {    # $p climbed $n folders up
 # Brace expansion, which the shell does before ~ and $ expansion:
 # "a{b,c}d" gives "abd" and "acd" (nested groups too). Only a group with a
 # comma at its top level expands; ${…} is a variable, not a group. More than
-# $BRACE_CAP words is an error.
+# $BRACE_CAP words is an error, except with $BRACE_SOFT set (text that is
+# only maybe code, see Guard::_item): then the word is taken as written.
+# Only unquoted braces expand (see %VIEW above).
 my $BRACE_CAP = 256;
+our $BRACE_SOFT = 0;
 
 sub _brace_group {    # (before, [alternatives], after) of the first group, or ()
     my ($s) = @_;
@@ -544,26 +580,37 @@ sub _brace_group {    # (before, [alternatives], after) of the first group, or (
 
 sub brace_alts {
     my ($w) = @_;
-    return ($w) unless index($w, '{') >= 0 && index($w, ',') >= 0;
+    my $v = brace_view($w);
+    return ($w) unless index($v, '{') >= 0 && index($v, ',') >= 0;
     my (@out, @todo);
-    @todo = ($w);
+    @todo = ($v);
     while (@todo) {
         my $s = shift @todo;
         my ($pre, $alts, $post) = _brace_group($s);
         if (!defined $pre) { push @out, $s; next }
         push @todo, map { "$pre$_$post" } @$alts;
-        die "too many brace expansions\n" if @out + @todo > $BRACE_CAP;
+        next unless @out + @todo > $BRACE_CAP;
+        return ($w) if $BRACE_SOFT;
+        die "too many brace expansions\n";
     }
+    if ($v ne $w) { tr/\x1c\x1d\x1e/{,}/ for @out }
     return uniq(@out);
 }
 
+# Every spelling of a path word from each base: the word as written and
+# each of its brace expansions.
 sub candidate_spellings {
     my ($c, $bases, $gate, $fast) = @_;
-    my @out;
     my @alts = brace_alts($c);
-    if (@alts > 1 || $alts[0] ne $c) { push @out, candidate_spellings($_, $bases, $gate, $fast) for @alts }
+    return _candidates($c, $bases, $gate, $fast) if @alts == 1 && $alts[0] eq $c;
+    return map { _candidates($_, $bases, $gate, $fast) } uniq($c, @alts);
+}
+
+sub _candidates {    # candidate_spellings without brace expansion
+    my ($c, $bases, $gate, $fast) = @_;
+    my @out;
     my $rest = prefix_rest($c);
-    push @out, candidate_spellings($rest, $bases, $gate, $fast) if defined $rest && $rest ne $c;
+    push @out, _candidates($rest, $bases, $gate, $fast) if defined $rest && $rest ne $c;
     my $x = expand($c, "\x02");
     my @bases = (substr($x, 0, 1) eq '/' && index($x, "\x02") < 0) ? ($bases->[0]) : @$bases;
     # Fast path ($fast, needs $gate): a relative word made of leading . and ..
@@ -615,8 +662,11 @@ sub candidate_spellings {
 }
 
 # Every spelling of every path a text may refer to, from the given bases.
+# Free text (a prompt, a JSON body) is only maybe code: past the brace cap a
+# word is taken as written.
 sub text_paths {
     my ($text, $bases, $gate) = @_;
+    local $BRACE_SOFT = 1;
     return uniq(map { candidate_spellings($_, $bases, $gate) } path_candidates($text));
 }
 

@@ -747,6 +747,93 @@ test_cd_many_targets_time() { # repeated targets are counted once; many targets 
   [ "$ELAPSED" -lt 2500 ] || { echo "40 targets + 1200 words took ${ELAPSED} ms"; return 1; }
 }
 
+# ---- fix round 5: newline words, zsh swaps, quoted braces (R37) ------------
+
+test_newline_words() { # a word that ends in a newline is a path like any other, not a guard error
+  t_two_profiles
+  mkdir -p "$HOME/repo"
+  local c nl=$'\n'
+  for c in "printf \$'hello\\n'" "IFS=\$'\\n'; for f in \$(ls); do echo \"\$f\"; done" \
+           "git commit -m \"fix: thing${nl}\"" "echo \"a${nl}\" > out.txt"; do
+    _sh work "$c" "$HOME/repo"
+    _allowed "cwd repo: $c" || return 1
+  done
+  _sh work "cat \"\$HOME/.claude/x${nl}\"" "$HOME/repo"
+  _blocked "read-denied root, word ends in a newline" || return 1
+  for c in "echo x > \"\$HOME/.claude-work/x${nl}\"" "echo x > \$'$HOME/.claude-work/x\\n'" \
+           "echo x > \"\$HOME/.claude-wo\"'rk/x'\$'\\n'" "cp a \$'$HOME/.claude-work/\\n'"; do
+    _sh personal "$c" "$HOME/repo"
+    _blocked "write-denied root, word ends in a newline: $c" || return 1
+  done
+}
+
+test_zsh_swap_every_spelling() { # zsh `cd old new` edits any spelling of $PWD: missing or a duplicate too
+  t_two_profiles
+  mkdir -p "$HOME/.claude/projects" "$HOME/work" "$HOME/src/proj" "$HOME/work2"
+  ln -s "$HOME/src/proj" "$HOME/work2/proj"
+  local c
+  for c in 'mkdir -p ~/proj/projects && cd ~/proj/projects && cd proj .claude && cat x' \
+           'mkdir -p ~/proj/projects && cd ~/proj/projects && cd proj .claude && grep -r foo'; do
+    _sh work "$c" "$HOME/work"
+    _blocked "from a missing folder: $c" || return 1
+  done
+  _sh work 'cd ~/src/proj && cd src/proj .claude/projects && cat x' "$HOME/work2/proj"
+  _blocked "from the real path of a symlinked cwd" || return 1
+  _sh work 'cd ~/work2/proj && cd work2/proj .claude/projects && cat x' "$HOME/src/proj"
+  _blocked "from the symlink spelling of the cwd" || return 1
+  mkdir -p "$HOME/q/qa/qb/s/qa/qb" "$HOME/q/qa/qb/s/qc"    # the swap words exist, so they make no near holes
+  _sh work 'mkdir -p ~/q/qc/s && cd qa/qb qc && cat ../../../.claude/x' "$HOME/q/qa/qb/s"
+  _blocked "from a base, a missing result is kept (made first)" || return 1
+  ln -s . "$HOME/src/proj/zqzq"
+  for c in 'cd ~/src/proj && cd src lib && cat x' 'cd ~/work2/proj && cd proj nothere && cat x' \
+           'cd zqzq; cd zqzq zqzq/zqzq; cd zqzq/zqzq zqzq/zqzq/zqzq/zqzq; make'; do
+    _sh work "$c" "$HOME/src/proj"
+    _allowed "cwd src/proj: $c" || return 1
+  done
+}
+
+test_quoted_braces_stay() { # R37: like bash, only braces outside quotes expand
+  t_two_profiles
+  mkdir -p "$HOME/repo"
+  local c i objs='' objs12=''
+  for i in 1 2 3 4 5 6 7 8 9; do objs="$objs{\"id\":$i,\"n\":\"a\"}, "; done
+  for i in $(seq 1 12); do objs12="$objs12{\"id\":$i,\"n\":\"a\"},"; done
+  objs=${objs%, }; objs12=${objs12%,}
+  for c in "curl -X POST -d '[$objs]' https://example.com/api" "echo '[$objs12]' > data.json" \
+           "curl -d \"[${objs12//\"/\\\"}]\" https://example.com" "bash -c 'echo \"[${objs12//\"/\\\"}]\"'" \
+           "cat '{~/.cla,x}ude/x'" 'cat "{~/.cla,x}ude/x"' 'cat \{~/.cla,x\}ude/x'; do
+    _sh work "$c" "$HOME/repo"
+    _allowed "cwd repo: ${c:0:80}" || return 1
+  done
+  _tool work Task prompt "post [$objs12] to the API"
+  _allowed "free text in another tool" || return 1
+  for c in 'cat {~/.cla,x}ude/x' 'cat {~/.claude,x}/settings.json' "bash -c 'cat {~/.cla,x}ude/f'" \
+           "echo \"\$(cat {~/.cla,x}ude/f)\"" "trap 'cat {~/.cla,x}ude/f' EXIT" \
+           "echo '{~/.cla,x}ude/f'; cat {~/.cla,x}ude/f" "cat {~/.cla,x}ude/f; echo '{~/.cla,x}ude/f'"; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "cwd repo: $c" || return 1
+  done
+  for c in 'cp a {~/.claude-wo,x}rk/settings.json' "bash -c 'cat {~/.claude-work,x}/f'" \
+           "bash -c 'cat {~/.claude-wo,x}rk/f'"; do
+    _sh personal "$c" "$HOME/repo"
+    _blocked "personal (may read work): $c" || return 1
+  done
+  _paths 'ClaudeApart::Paths::shell_words($ARGV[0]); print join " ", ClaudeApart::Paths::brace_alts($ARGV[1])' \
+    "a'{b,c}'{d,e}" 'a{b,c}{d,e}'
+  assert_eq 'a{b,c}d a{b,c}e' "$OUT" "only the unquoted group expands" || return 1
+  for c in "echo [$objs12]" "bash -c 'echo [$objs12]'"; do    # unquoted for the shell that runs it
+    _sh work "$c" "$HOME/repo"
+    _guard_error "4096 brace words: ${c:0:40}" || return 1
+  done
+  perl -ni -e 'print unless /^can_read/' "$XDG_CONFIG_HOME/claude-apart/config"
+  for c in 'cat {~/.claude-work,x}/settings.json' 'cat {~/.claude-wo,x}rk/settings.json'; do
+    _sh personal "$c" "$HOME/repo"
+    _blocked "personal (no grant): $c" || return 1
+  done
+  _sh personal "cat '{~/.claude-wo,x}rk/settings.json'" "$HOME/repo"
+  _allowed "personal (no grant): quoted braces stay" || return 1
+}
+
 test_recursive_ancestor_blocked() {
   t_two_profiles
   mkdir -p "$HOME/repo"
