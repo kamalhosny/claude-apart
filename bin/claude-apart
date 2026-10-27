@@ -11,6 +11,15 @@ Run claude-apart help for this text.
 USAGE
 }
 
+# These write into every profile's setup, so never from inside a session.
+case "${1:-}" in
+  setup|add|remove|login|copy|sync|uninstall)
+    if [ "${CLAUDE_CODE_CHILD_SESSION:-}" = 1 ]; then
+      echo "claude-apart: run this in a normal terminal, not inside Claude." >&2
+      exit 1
+    fi ;;
+esac
+
 case "${1:-}" in
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;

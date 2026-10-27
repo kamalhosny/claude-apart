@@ -117,7 +117,7 @@ test_herdr_label_selects_profile() {
 
 test_herdr_unlabelled_falls_back_to_default() {
   t_two_profiles
-  _herdr_stub "xpark"
+  _herdr_stub "project"
   HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude
   assert_rc 0 "claude" || return 1
   assert_contains "$(_log)" "PROFILE=work" "default" || return 1

@@ -9,6 +9,9 @@
 # kept within 0.05..5 s: below 1 µs Time::HiRes::alarm would set no timer at
 # all. A value that is not a plain number is ignored.
 # This alarm is the only one in the hook processes.
+# The child starts its own process group, so a kill at the budget also stops
+# what it started (herdr lookups). If the group kill fails (the child had no
+# time to make its group yet), the child itself is killed.
 BEGIN {
     if (@ARGV && $ARGV[0] eq 'hook') {
         my $fail = sub { syswrite STDERR, "claude-apart: guard error \xe2\x80\x94 blocked to be safe.\n"; CORE::exit(2) };
@@ -20,9 +23,10 @@ BEGIN {
         }
         my $pid = fork;
         $fail->() unless defined $pid;
+        setpgrp(0, 0) unless $pid;
         if ($pid) {
             require Time::HiRes;
-            $SIG{ALRM} = sub { kill 'KILL', $pid; $fail->() };
+            $SIG{ALRM} = sub { kill('KILL', -$pid) or kill('KILL', $pid); $fail->() };
             Time::HiRes::alarm($budget);
             my $got = waitpid($pid, 0);
             my $st = $?;

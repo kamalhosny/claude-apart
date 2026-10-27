@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use ClaudeApart::Config;
 use ClaudeApart::Paths;
+use ClaudeApart::Herdr;
 
 # PreToolUse verdicts. verdict() returns undef (allow) or 'block'.
 # "read" roots: foreign paths this profile may not read.
@@ -46,7 +47,7 @@ my %EVAL_NAME  = map { $_ => 1 } qw(eval trap watch alias);
 # to block. $sh->{segments} holds the simple commands; see _analyse. Later
 # tasks add rules here.
 our @SHELL_RULES = (\&_rule_read_denied, \&_rule_write_denied, \&_rule_recursive_reader,
-                    \&_rule_recursive_modifier);
+                    \&_rule_recursive_modifier, \&_rule_launcher, \&_rule_env, \&_rule_herdr);
 
 sub verdict {
     my ($cfg, $profile, $tool, $input, $cwd) = @_;
@@ -65,10 +66,12 @@ sub _context {
     my ($rd, $wd) = ClaudeApart::Config::foreign_paths($cfg, $profile);
     my %r = map { $_ => 1 } @$rd;
     return {
-        cwd   => $cwd,
-        read  => ClaudeApart::Paths::root_set(@$rd),
-        write => ClaudeApart::Paths::root_set(@$wd),
-        wonly => ClaudeApart::Paths::root_set(grep { !$r{$_} } @$wd),
+        cfg     => $cfg,
+        profile => $profile,
+        cwd     => $cwd,
+        read    => ClaudeApart::Paths::root_set(@$rd),
+        write   => ClaudeApart::Paths::root_set(@$wd),
+        wonly   => ClaudeApart::Paths::root_set(grep { !$r{$_} } @$wd),
     };
 }
 
@@ -193,9 +196,10 @@ sub _shell {
 # targets and whether the shell runs it. A quoted word that holds shell code
 # (bash -c "…", "$(…)") is analysed one level deeper; its segments count as
 # run only for $(…) and backticks. Each word item is
-# {w => text, sp => [spellings of its path pieces]}. Relative words are taken
-# from every folder in $sh->{dirs}, and from the "missing" folders in
-# $sh->{holes} when they climb out of them (see _cd_dirs).
+# {w => text, sp => [spellings of its path pieces], nested => analysed
+# deeper}. Relative words are taken from every folder in $sh->{dirs}, and
+# from the "missing" folders in $sh->{holes} when they climb out of them
+# (see _cd_dirs).
 sub _analyse {
     my ($ctx, $cmd) = @_;
     my $sh = { text => $cmd, segments => [], memo => {} };
@@ -246,11 +250,12 @@ sub _walk {
 sub _item {
     my ($ctx, $sh, $w, $depth, $exec, $code) = @_;
     my @sp = map { _piece($ctx, $sh, $_) } ClaudeApart::Paths::word_pieces($w);
-    if (_nested($w, $depth)) {
+    my $nested = _nested($w, $depth);
+    if ($nested) {
         local $ClaudeApart::Paths::BRACE_SOFT = ($code || $w =~ /\$\(|`/) ? 0 : 1;
         _walk($ctx, $sh, $w, $depth + 1, ($exec && $w =~ /\$\(|`/) ? 1 : 0);
     }
-    return { w => $w, sp => [ ClaudeApart::Paths::uniq(@sp) ] };
+    return { w => $w, sp => [ ClaudeApart::Paths::uniq(@sp) ], nested => $nested };
 }
 
 # For each word of a simple command: is it surely shell code (see %SHELL_NAME)?
@@ -695,6 +700,120 @@ sub _operands {
     my $files = $name eq 'rg' && grep { $_->{w} eq '--files' } @$rest;
     shift @ops if $PATTERN_FIRST{$name} && !$given && !$files;
     return \@ops;
+}
+
+# ---- launchers, env and Herdr -------------------------------------------------
+# These rules see every simple command, also inside nested code. A word that
+# holds nested code is skipped here: its own words are seen one level deeper.
+
+my $CLAUDE_APART = qr{(?:\A|[=/])claude-apart\z}i;
+my $HERDR_WORD   = qr{(?:\A|[=/])herdr\z}i;
+my %APART_SAFE   = map { $_ => 1 } qw(status check help -h --help);
+my $ENV_NAME     = qr/CLAUDE_CONFIG_DIR|CLAUDE_APART_PROFILE|CLAUDE_CODE_CHILD_SESSION/;
+
+# Another profile's launcher: a word, or an a=b piece of one, named
+# claude-<other profile>. And R10: `claude-apart` followed by anything but
+# status, check, help, -h, --help or `new <own profile>` (the others write
+# into every profile's setup). A bare `claude-apart` only prints its usage,
+# and so does one followed by a plain path (`git add bin/claude-apart lib/x`):
+# the CLI takes its subcommand from fixed names only.
+# Glued after = (c=claude-apart) it may run later with any words: block.
+sub _rule_launcher {
+    my ($ctx, $sh) = @_;
+    my $own = $ctx->{profile};
+    my %other = map { $_ => 1 } grep { $_ ne $own } ClaudeApart::Config::profile_names($ctx->{cfg});
+    for my $seg (@{ $sh->{segments} }) {
+        my @it = @{ $seg->{words} };
+        for my $k (0 .. $#it) {
+            next if $it[$k]{nested};
+            for my $p (ClaudeApart::Paths::word_pieces($it[$k]{w})) {
+                my $n = _name($p);
+                return 1 if defined $n && $n =~ /\Aclaude-(.+)\z/i && $other{ lc $1 };
+            }
+            next unless $it[$k]{w} =~ $CLAUDE_APART;
+            return 1 if index($it[$k]{w}, '=') >= 0;
+            next if $k == $#it;
+            my $sub = $it[ $k + 1 ]{w};
+            next if $APART_SAFE{$sub} || $sub =~ m{\A[A-Za-z0-9._~+-]*/[A-Za-z0-9._~+/-]*\z};
+            next if $sub eq 'new' && $k + 2 <= $#it && $it[ $k + 2 ]{w} eq $own;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# R11: any mention of CLAUDE_CONFIG_DIR, CLAUDE_APART_PROFILE or
+# CLAUDE_CODE_CHILD_SESSION blocks (so `unset …` and `env -u …` do), except
+# an assignment that names the own profile. `env -i` is a known limit.
+sub _rule_env {
+    my ($ctx, $sh) = @_;
+    my $seen = 0;
+    for my $seg (@{ $sh->{segments} }) {
+        for my $it (@{ $seg->{words} }, @{ $seg->{redirects} }) {
+            next if $it->{nested} || $it->{w} !~ $ENV_NAME;
+            $seen = 1;
+            return 1 unless _own_assignment($ctx, $it->{w});
+        }
+    }
+    return (!$seen && $sh->{text} =~ $ENV_NAME) ? 1 : 0;    # a mention no word showed
+}
+
+# CLAUDE_APART_PROFILE=<own name>, or CLAUDE_CONFIG_DIR=<the own dir>
+# (absolute after ~ or $HOME, in any spelling that resolves to it).
+sub _own_assignment {
+    my ($ctx, $w) = @_;
+    return 0 unless $w =~ /\A(CLAUDE_CONFIG_DIR|CLAUDE_APART_PROFILE)=(.*)\z/s;
+    my ($name, $v) = ($1, $2);
+    return 0 if $v =~ $ENV_NAME;
+    return $v eq $ctx->{profile} ? 1 : 0 if $name eq 'CLAUDE_APART_PROFILE';
+    my $p = ClaudeApart::Paths::expand($v, $ctx->{cwd});
+    return 0 unless substr($p, 0, 1) eq '/' && $p !~ /[\$`]/ && $p !~ ClaudeApart::Paths::glob_chars();
+    my $own = ClaudeApart::Config::profile($ctx->{cfg}, $ctx->{profile})->{abs_dir};
+    return ClaudeApart::Paths::fold(ClaudeApart::Paths::canon($p, '/'))
+        eq ClaudeApart::Paths::fold(ClaudeApart::Paths::canon($own, '/')) ? 1 : 0;
+}
+
+# Herdr: a read needs every target in the own or a readable profile; input
+# (also rename, close, move) needs the own profile, and a new workspace
+# label may not name another profile or be unknown. A target that maps to
+# no profile, a failed or slow lookup, and a command for another server all
+# block. So does a command that changes the Herdr env the lookups rely on
+# (HERDR_SOCKET=…, unset HERDR_…); $HERDR_PANE_ID and the like may be read.
+# A herdr glued after = (h=herdr) may run later with any words: block.
+sub _rule_herdr {
+    my ($ctx, $sh) = @_;
+    my @calls;
+    for my $seg (@{ $sh->{segments} }) {
+        my @it = @{ $seg->{words} };
+        for my $k (0 .. $#it) {
+            next if $it[$k]{nested} || $it[$k]{w} !~ $HERDR_WORD;
+            return 1 if index($it[$k]{w}, '=') >= 0;
+            my $c = ClaudeApart::Herdr::parse_command([ map { $_->{w} } @it[ $k + 1 .. $#it ] ]);
+            push @calls, $c unless $c->{kind} eq 'other';
+        }
+    }
+    return 0 unless @calls;
+    for my $seg (@{ $sh->{segments} }) {
+        for my $it (@{ $seg->{words} }, @{ $seg->{redirects} }) {
+            return 1 if !$it->{nested} && $it->{w} =~ /(?<![\$\{])HERDR_/;
+        }
+    }
+    my $own = $ctx->{profile};
+    my %readable = map { $_ => 1 } $own, @{ ClaudeApart::Config::profile($ctx->{cfg}, $own)->{can_read} };
+    for my $c (@calls) {
+        return 1 if $c->{machine} || !@{ $c->{targets} };
+        for my $t (@{ $c->{targets} }) {
+            my $p = ClaudeApart::Herdr::profile_of_target($ctx->{cfg}, $t->[1], $t->[0]);
+            return 1 unless defined $p;
+            return 1 if $c->{kind} eq 'input' ? $p ne $own : !$readable{$p};
+        }
+        for my $l (@{ $c->{labels} }) {
+            return 1 unless defined $l;
+            my $p = ClaudeApart::Herdr::profile_for_label($ctx->{cfg}, $l);
+            return 1 if defined $p && $p ne $own;
+        }
+    }
+    return 0;
 }
 
 1;
