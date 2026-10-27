@@ -41,7 +41,8 @@ curl -fsSL https://raw.githubusercontent.com/OWNER/claude-apart/main/install.sh 
 - It installs into `~/.local/share/claude-apart` (set `CLAUDE_APART_HOME` to
   use another folder). No root needed.
 - It adds one line to `~/.zshrc` and `~/.bashrc` (only the ones that exist)
-  that puts `<prefix>/bin` first on your `PATH`. The line ends with
+  that puts `<prefix>/bin` first on your `PATH` (if neither exists, it creates
+  `~/.zshrc`). The line ends with
   `# claude-apart`.
 - It never touches `~/.local/bin`, and never changes the real `claude`.
 - Run it again to update. Your launchers stay. If you already have a config,

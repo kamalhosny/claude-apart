@@ -24,6 +24,7 @@ _ca_rc_unmark() { # <file>
 
 ca_uninstall() {
   local purge=0 rc=0 names n rcf cfgdir state l t
+  local here home
   while [ $# -gt 0 ]; do
     case "$1" in
       --purge) purge=1 ;;
@@ -32,8 +33,22 @@ ca_uninstall() {
     shift
   done
 
+  # never take apart a clone that is used as the install folder
+  here=$(cd "$CA_ROOT" && pwd -P)
+  home=$(cd "$CA_HOME" 2>/dev/null && pwd -P)
+  if [ "$here" = "$home" ] && [ -f "$CA_ROOT/install.sh" ]; then
+    ca_err "the install folder is the folder this code runs from (a clone); nothing was removed."
+    return 1
+  fi
+
   # 1. the guard out of every profile (only what claude-apart added)
-  names=$(capart config profiles 2>/dev/null)
+  # a config that exists but cannot be read must stop us: the profiles would
+  # keep hooks that point at the copy we are about to remove
+  if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/claude-apart/config" ]; then
+    names=$(capart config profiles) || { ca_err "cannot read the config; nothing was removed."; return 1; }
+  else
+    names=
+  fi
   for n in $names; do
     if capart settings uninstall --profile "$n" >/dev/null; then
       echo "$n: guard removed"

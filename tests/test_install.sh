@@ -132,3 +132,68 @@ test_rc_symlink_stays_a_symlink() {
   cmp "$HOME/dotfiles/zshrc" "$T/zshrc.orig" || { echo "real file changed beyond the marked line"; cat "$HOME/dotfiles/zshrc"; return 1; }
   assert_eq "-rw-r-----" "$(ls -l "$HOME/dotfiles/zshrc" | cut -c1-10)" "mode kept" || return 1
 }
+
+test_uninstall_corrupt_config_stops() {
+  t_two_profiles
+  run "$REPO/install.sh"; assert_rc 0 "install" || return 1
+  printf '[profile\nthis is = = not a config\n\x01\n' > "$XDG_CONFIG_HOME/claude-apart/config"
+  run "$T/prefix/bin/claude-apart" uninstall
+  assert_rc 1 "stops" || return 1
+  [ -x "$T/prefix/bin/claude-apart" ] || { echo "copy removed"; return 1; }
+  [ "$(_count "$HOME/.zshrc" "# claude-apart")" = 1 ] || { echo "rc line removed"; return 1; }
+}
+
+test_uninstall_stops_when_one_profile_fails() {
+  t_two_profiles
+  run "$REPO/install.sh"; assert_rc 0 "install" || return 1
+  printf '{ not json' > "$HOME/.claude-work/settings.json"
+  run "$T/prefix/bin/claude-apart" uninstall
+  assert_rc 1 "stops" || return 1
+  [ -x "$T/prefix/bin/claude-apart" ] || { echo "copy removed"; return 1; }
+  [ "$(_count "$HOME/.zshrc" "# claude-apart")" = 1 ] || { echo "rc line removed"; return 1; }
+}
+
+test_uninstall_twice_is_harmless() {
+  t_two_profiles
+  run "$REPO/install.sh"; assert_rc 0 "install" || return 1
+  run "$T/prefix/bin/claude-apart" uninstall; assert_rc 0 "first" || return 1
+  run "$REPO/bin/claude-apart" uninstall; assert_rc 0 "second" || return 1
+}
+
+test_uninstall_refuses_when_prefix_is_the_clone() {
+  mkdir "$T/clone" && cp -R "$REPO/bin" "$REPO/lib" "$REPO/libexec" "$REPO/install.sh" "$T/clone/"   # a copy, never the real repo
+  CLAUDE_APART_HOME="$T/clone" run "$T/clone/bin/claude-apart" uninstall
+  assert_rc 1 "refused" || return 1
+  [ -d "$T/clone/lib/ClaudeApart" ] && [ -x "$T/clone/bin/claude-apart" ] || { echo "clone damaged"; return 1; }
+}
+
+test_failed_copy_keeps_the_old_install() {
+  run "$REPO/install.sh"; assert_rc 0 "install" || return 1
+  echo old > "$T/prefix/lib/marker"
+  cat > "$T/bin/cp" <<'EOF2'
+#!/bin/sh
+case "$*" in *libexec*) exit 1 ;; esac
+exec /bin/cp "$@"
+EOF2
+  chmod +x "$T/bin/cp"
+  run "$REPO/install.sh"
+  assert_rc 1 "install fails" || return 1
+  assert_contains "$ERR" "install failed; run install.sh again." "message" || return 1
+  [ -f "$T/prefix/lib/marker" ] && [ -x "$T/prefix/bin/claude-apart" ] && [ -d "$T/prefix/libexec" ] || { echo "old copy damaged"; return 1; }
+  [ -z "$(ls -A "$T/prefix" | grep '^\.install')" ] || { echo "stage left"; return 1; }
+}
+
+test_rc_files_without_final_newline_round_trip() {
+  printf 'alias a=b\nexport PATH="%s/bin:$PATH"  # claude-apart\nlast line no newline' "$T/prefix" > "$HOME/.bashrc"
+  cp "$HOME/.bashrc" "$T/bashrc.orig"
+  run "$REPO/install.sh"; assert_rc 0 "install" || return 1
+  [ "$(_count "$HOME/.bashrc" "# claude-apart")" = 1 ] || { echo "line added twice"; return 1; }
+  run "$T/prefix/bin/claude-apart" uninstall; assert_rc 0 "uninstall" || return 1
+  printf 'alias a=b\nlast line no newline' > "$T/bashrc.want"
+  cmp "$HOME/.bashrc" "$T/bashrc.want" || { echo "bytes changed:"; od -c "$HOME/.bashrc" | tail -3; return 1; }
+  # marked line as the very last line, without newline
+  printf 'alias a=b\nexport PATH="%s/bin:$PATH"  # claude-apart' "$T/prefix" > "$HOME/.bashrc"
+  run "$REPO/install.sh"; assert_rc 0 "install 2" || return 1
+  run "$T/prefix/bin/claude-apart" uninstall; assert_rc 0 "uninstall 2" || return 1
+  assert_eq "alias a=b" "$(cat "$HOME/.bashrc")" "last-line case" || return 1
+}

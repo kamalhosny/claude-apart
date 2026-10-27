@@ -46,12 +46,27 @@ mkdir -p "$PREFIX/bin" || fail "cannot make $PREFIX/bin"
 real_prefix=$(cd "$PREFIX" && pwd -P)
 [ "$real_prefix" != "$SRC" ] || fail "the install folder is the folder you are installing from."
 
-# Replace the code; the claude and claude-<name> links in bin/ stay.
-rm -rf "$PREFIX/libexec" "$PREFIX/lib" "$PREFIX/bin/claude-apart"
-cp -R "$SRC/libexec" "$PREFIX/libexec" || fail "copy failed."
-cp -R "$SRC/lib" "$PREFIX/lib" || fail "copy failed."
-cp "$SRC/bin/claude-apart" "$PREFIX/bin/claude-apart" || fail "copy failed."
-chmod 755 "$PREFIX/bin/claude-apart"
+# Replace the code; the claude and claude-<name> links in bin/ stay. The new
+# copy is made complete first; an old part goes only after the new one is in.
+STAGE="$PREFIX/.install.$$"
+install_failed() { rm -rf "$STAGE"; fail "install failed; run install.sh again."; }
+rm -rf "$STAGE"
+mkdir -p "$STAGE" || install_failed
+cp -R "$SRC/libexec" "$STAGE/libexec" || install_failed
+cp -R "$SRC/lib" "$STAGE/lib" || install_failed
+cp "$SRC/bin/claude-apart" "$STAGE/claude-apart" || install_failed
+chmod 755 "$STAGE/claude-apart" || install_failed
+for part in libexec lib; do
+  rm -rf "$PREFIX/$part.old"
+  if [ -e "$PREFIX/$part" ]; then mv "$PREFIX/$part" "$PREFIX/$part.old" || install_failed; fi
+  if ! mv "$STAGE/$part" "$PREFIX/$part"; then
+    if [ -e "$PREFIX/$part.old" ]; then mv "$PREFIX/$part.old" "$PREFIX/$part"; fi
+    install_failed
+  fi
+  rm -rf "$PREFIX/$part.old"
+done
+mv -f "$STAGE/claude-apart" "$PREFIX/bin/claude-apart" || install_failed
+rm -rf "$STAGE"
 say "Installed claude-apart into $PREFIX"
 
 # PATH line in the shell startup files. Appending (>>) keeps a symlinked file
