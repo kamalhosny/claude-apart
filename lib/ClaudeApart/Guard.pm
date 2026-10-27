@@ -225,12 +225,14 @@ sub _walk {
     my ($ctx, $sh, $text, $depth, $exec, $sure) = @_;
     my ($words, $redirs, $want_target) = ([], [], 0);
     my (@wsoft, @rsoft);    # R40 (b): the word is in a heredoc body
+    my $pipe = [];          # words of the earlier commands of this pipeline
     my $end = sub {
         return unless @$words || @$redirs;
         my @code = _code_flags($words);
         push @{ $sh->{segments} }, {
             exec      => $exec,
             code      => $sure,
+            pipe_in   => [@$pipe],
             words     => [ map { _item($ctx, $sh, $words->[$_], $depth, $exec, $sure, $code[$_], $wsoft[$_]) } 0 .. $#$words ],
             redirects => [ map { _item($ctx, $sh, $redirs->[$_], $depth, $exec, $sure, 0, $rsoft[$_]) } 0 .. $#$redirs ],
         };
@@ -245,7 +247,12 @@ sub _walk {
             next;
         }
         (my $rest = $w) =~ s/&?[<>]+[&|]?//g;
-        if (length $rest) { $end->(); $want_target = 0 }
+        if (length $rest) {
+            my $done = $words;
+            $end->();
+            $pipe = $rest =~ /\A\|&?\z/ ? [ @$pipe, @$done ] : [];
+            $want_target = 0;
+        }
         $want_target = 1 if $rest ne $w && $w !~ /\(/;
     }
     $end->();
@@ -845,13 +852,14 @@ sub _apart_blocks {
 # before it (from the command word on) runs? Not when a real program option
 # comes between them: then the program is that option's text and the word
 # is a data file (`perl -ne '…' capart.pl`). perl -n or -p alone give no
-# program, nor does ruby -E (an encoding).
+# program, nor does ruby -E (an encoding). A shell's -c gives none either
+# (R76): the word after it is the program, and later words become $0 and
+# $@, which the program can run.
 my %PROGRAM_OPT = (
     perl   => qr/\A-(?:[aclnpsStTuUwWX]|[0l][0-7]*)*[eE]\z/,
     ruby   => qr/\A-[acdlnpsSvwy]*e\z/,
     node   => qr/\A(?:-[ep]|--eval|--print)\z/,
     python => qr/\A-[bBdEhiIOqRsSuvx]*c\z/,
-    shell  => qr/\A-[A-Za-z]*c[A-Za-z]*\z/,
 );
 my %RUNNER_KIND = ((map { $_ => 'shell' } qw(sh bash zsh dash ksh csh tcsh fish)),
                    perl => 'perl', ruby => 'ruby', node => 'node', python => 'python', python3 => 'python');
@@ -965,32 +973,44 @@ sub _names_launcher {
 # F6: a new terminal, a tmux or screen server, osascript, open, an at,
 # batch, cron or launchd job, ssh and systemd-run run their command without
 # this session's environment, so a plain claude there starts the default
-# profile (and claude-<other> another profile). Blocked: such a word (from
-# the command word on, not after which/type) with a later word named claude
-# or claude-<profile other than the own one>, at any quoting depth. at,
-# batch, crontab, ssh and osascript also read commands from stdin, and
-# xargs feeds words from it: there a launcher word anywhere in the command
-# blocks. Only surely-code segments count (a quoted message passes).
+# profile (and claude-<other> another profile). Blocked: such a command
+# word (after prefixes, or the command xargs or parallel runs; not after
+# which/type) with a later word named claude or claude-<profile other than
+# the own one>, at any quoting depth. at, batch, crontab, ssh and osascript
+# also read commands from stdin, and xargs feeds words from it: there a
+# launcher word in an earlier command of the same pipeline blocks too
+# (R76: never the rest of the line, so `gh pr list --state open --search
+# claude` passes). Only surely-code segments count (a quoted message passes).
 my %NEW_TERM = map { $_ => 1 } qw(tmux screen zellij osascript open at batch crontab launchctl ssh systemd-run);
 my %READS_IN = map { $_ => 1 } qw(at batch crontab ssh osascript);
 
 sub _rule_new_terminal {
     my ($ctx, $sh) = @_;
     for my $seg (grep { $_->{code} } @{ $sh->{segments} }) {
-        return 1 if _new_terminal_blocks($ctx, [ map { $_->{w} } @{ $seg->{words} } ], $sh->{text});
+        return 1 if _new_terminal_blocks($ctx, [ map { $_->{w} } @{ $seg->{words} } ], $seg->{pipe_in});
     }
     return 0;
 }
 
 sub _new_terminal_blocks {
-    my ($ctx, $w, $all) = @_;
+    my ($ctx, $w, $pipe_in) = @_;
     my $ci = _cmd_index($w);
-    my $fed = $ci < @$w && $FEEDS_ARGS{ _name($w->[$ci]) // '' };
-    for my $k ($ci .. $#$w) {
+    return 0 if $ci > $#$w;
+    my $fed = $FEEDS_ARGS{ _name($w->[$ci]) // '' };
+    my @k = ($ci);
+    # the command word may be a prefix option's value (sudo -u me tmux …)
+    push @k, $ci + 1 if $ci > 0 && $w->[ $ci - 1 ] =~ /\A-/;
+    if ($fed) {
+        my $k = $ci + 1;
+        $k++ while $k <= $#$w && $w->[$k] =~ /\A(?:-|\d+\z)/;
+        @k = ($k);
+    }
+    for my $k (grep { $_ <= $#$w } @k) {
         my $n = _name($w->[$k]) // next;
         next unless $NEW_TERM{$n} && !_lookup_only($w, $k);
         for my $x (@$w[ $k + 1 .. $#$w ]) { return 1 if _names_launcher($ctx, $x, 0) }
-        return 1 if ($READS_IN{$n} || $fed) && _names_launcher($ctx, $all, 0);
+        next unless $READS_IN{$n} || $fed;
+        for my $x (@{ $pipe_in || [] }) { return 1 if _names_launcher($ctx, $x, 0) }
     }
     return 0;
 }
@@ -1143,18 +1163,26 @@ sub _typed_blocks {
     my $own = $ctx->{profile};
     return 1 if $depth > $MAX_DEPTH;
     my @segs = ([]);
+    my %pipe_in;    # segment => words of the earlier commands of its pipeline
     for my $t (ClaudeApart::Paths::shell_words($text)) {
-        if ($t->[1]) { push @segs, [] } else { push @{ $segs[-1] }, $t->[0] }
+        unless ($t->[1]) { push @{ $segs[-1] }, $t->[0]; next }
+        my $prev = $segs[-1];
+        push @segs, [];
+        $pipe_in{ $segs[-1] } = [ @{ $pipe_in{$prev} || [] }, @$prev ] if $t->[0] =~ /\A\|&?\z/;
     }
     for my $w (grep { @$_ } @segs) {
         my $ci = _cmd_index($w);
         my $n = $ci < @$w ? _name($w->[$ci]) // '' : '';
-        if ($n =~ $CLAUDE_APART) { return 1 if _apart_blocks($own, $w, $ci) }
+        # R76: a pane shell is not a session, so status and check there
+        # would print every profile's identity for this session to read back
+        if ($n =~ $CLAUDE_APART) {
+            return 1 if _apart_blocks($own, $w, $ci) || ($ci < $#$w && $w->[ $ci + 1 ] =~ /\A(?:status|check)\z/);
+        }
         elsif ($n =~ /\Aclaude-(.*)\z/is) {
             my $rest = $1;
             return 1 if $rest !~ /\A[a-z0-9-]+\z/ || ($rest ne $own && $ctx->{names}{$rest});
         }
-        return 1 if _env_clear_claude($ctx, $w) || _new_terminal_blocks($ctx, $w, $text) || _keychain_blocks($w, $text);
+        return 1 if _env_clear_claude($ctx, $w) || _new_terminal_blocks($ctx, $w, $pipe_in{$w}) || _keychain_blocks($w, $text);
         my @code = _code_flags($w);
         for my $i (0 .. $#$w) {
             return 1 if ($code[$i] || $w->[$i] =~ $CODE) && _typed_blocks($ctx, $w->[$i], $depth + 1);

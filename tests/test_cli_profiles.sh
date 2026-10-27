@@ -800,9 +800,20 @@ test_guard_capart_as_data_after_program_option() { # R67 (2) as corrected
   mkdir -p "$cwd" "${cap%/*}"
   for c in "perl -ne 'print if /session/' $cap" "perl -lne 'print' $cap" "perl -E 'say 1' $cap" \
            "ruby -e 'puts ARGF.read.size' $cap" "node -e 'console.log(1)' $cap" \
-           "python3 -c 'import sys; print(sys.argv)' $cap" "bash -c 'wc -l \"\$0\"' $cap" "sh -ec true $cap"; do
+           "python3 -c 'import sys; print(sys.argv)' $cap"; do
     pre_tool work Bash "{\"command\":$(_json_str "$c")}" "$cwd"
     assert_rc 0 "allowed: $c" || return 1
+  done
+}
+
+test_guard_shell_c_words_may_run_capart() { # R76: a shell's -c program can run $0 and $@
+  t_two_profiles
+  local c cap="$HOME/elsewhere/libexec/claude-apart/capart.pl" cwd="$HOME/proj"
+  mkdir -p "$cwd" "${cap%/*}"
+  for c in "bash -c $cap" "sh -c '\"\$0\" settings uninstall --profile personal' $cap" \
+           "bash -c 'wc -l \"\$0\"' $cap" "sh -ec true $cap"; do
+    pre_tool work Bash "{\"command\":$(_json_str "$c")}" "$cwd"
+    assert_rc 2 "blocked: $c" || return 1
   done
 }
 

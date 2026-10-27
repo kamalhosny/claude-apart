@@ -552,12 +552,12 @@ test_typed_text_launcher_narrowed() { # R55 (1): only another profile's or an un
   t_two_profiles
   _herdr_std
   _lines personal allow <<'EOF2' || return 1
-herdr pane run w2:p2 'claude-apart status'
 herdr pane run w2:p2 'claude-apart new personal ideas'
 herdr agent prompt rev 'claude-code docs say hi'
 herdr pane run w2:p2 'claude-nope -p hi'
 EOF2
   _lines personal block <<'EOF2' || return 1
+herdr pane run w2:p2 'claude-apart status'
 herdr pane run w2:p2 'claude-apart sync'
 herdr pane run w2:p2 'claude-apart new work'
 herdr pane run w2:p2 'claude-apart --version'
@@ -622,6 +622,46 @@ open https://example.com/claude.html
 git commit -m "run tmux new -d claude later"
 which tmux claude
 herdr pane run w2:p2 'tmux new -d claude-personal'
+EOF2
+}
+
+test_new_terminal_rule_checks_only_the_command() { # R76: a word like open or at elsewhere is not a launch
+  t_two_profiles
+  _herdr_std
+  _lines work allow <<'EOF2' || return 1
+gh pr list --state open --search claude
+gh issue list --state open --label claude
+crontab -l | grep claude
+launchctl list | grep claude
+screen -ls | grep claude
+echo at claude
+git commit -m "teach claude to deploy" && ssh deploy@host 'cd app && git pull'
+git log | grep -i claude | head; ssh -T git@github.com
+echo hi | xargs tmux new -d
+EOF2
+  _lines work block <<'EOF2' || return 1
+echo claude | xargs -n 1 tmux new -d
+echo 'claude -p hi' | at now
+sudo -u me tmux new -d claude
+EOF2
+  _lines personal allow <<'EOF2' || return 1
+herdr agent prompt rev 'look at the claude wrapper in bin'
+herdr agent prompt rev 'please open the README and ask claude about it'
+herdr agent prompt rev 'the ssh key is wrong; claude said so'
+herdr pane send-text w2:p2 'what is at line 4 of the claude doc?'
+EOF2
+}
+
+test_typed_apart_status_blocks() { # R76: a pane shell is not a session, so status there shows every identity
+  t_two_profiles
+  _herdr_std
+  _lines personal block <<'EOF2' || return 1
+herdr pane run w2:p2 'claude-apart status'
+herdr pane run w2:p2 'claude-apart check'
+EOF2
+  _lines personal allow <<'EOF2' || return 1
+herdr pane run w2:p2 'claude-apart help'
+herdr pane run w2:p2 'claude-apart new personal'
 EOF2
 }
 

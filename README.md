@@ -253,8 +253,18 @@ What the tool does not cover:
   messages. Work-around: `git commit -F <file>`.
 - A quoted word with braces and a comma (`'{a,b}/x'`) is checked as if the
   braces expanded.
-- `open -a Claude` (the desktop app) counts as starting claude in a new
-  window and is blocked inside a session.
+- A command that starts a new terminal, server or job (`tmux`, `screen`,
+  `osascript`, `open`, `ssh`, `at`, `crontab`, `launchctl`, ...) is blocked
+  when any later word is named claude, in any letter case:
+  `tmux attach -t claude`, `ssh host 'systemctl status claude'`,
+  `osascript -e 'display notification "Claude is done"'`, `open -a Claude`
+  (the desktop app). The same words elsewhere in a command are fine
+  (`gh pr list --state open --search claude`).
+- `claude-apart status` and `check` typed into a Herdr pane are blocked: a
+  pane shell is not a session, so they would print every profile's account.
+- A shell's `-c` with the claude-apart script as a later word
+  (`bash -c '…' <tool folder>/libexec/claude-apart/capart.pl`) is blocked: the
+  program can run `$0`.
 - Agent, TodoWrite and MCP tool inputs that name a path inside the installed
   tool folder are blocked (it is write-protected for every profile).
 - Inside Herdr, if the workspace label cannot be read, plain `claude` refuses
