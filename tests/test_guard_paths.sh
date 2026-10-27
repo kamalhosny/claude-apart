@@ -800,10 +800,15 @@ test_quoted_braces_stay() { # R37: like bash, only braces outside quotes expand
   for i in $(seq 1 12); do objs12="$objs12{\"id\":$i,\"n\":\"a\"},"; done
   objs=${objs%, }; objs12=${objs12%,}
   for c in "curl -X POST -d '[$objs]' https://example.com/api" "echo '[$objs12]' > data.json" \
-           "curl -d \"[${objs12//\"/\\\"}]\" https://example.com" "bash -c 'echo \"[${objs12//\"/\\\"}]\"'" \
-           "cat '{~/.cla,x}ude/x'" 'cat "{~/.cla,x}ude/x"' 'cat \{~/.cla,x\}ude/x'; do
+           "curl -d \"[${objs12//\"/\\\"}]\" https://example.com" "bash -c 'echo \"[${objs12//\"/\\\"}]\"'"; do
     _sh work "$c" "$HOME/repo"
     _allowed "cwd repo: ${c:0:80}" || return 1
+  done
+  # R40 (a): a quoted one-word brace text is also parsed as code (it may be
+  # run by bash -c, eval or ssh), so it counts with its braces expanded
+  for c in "cat '{~/.cla,x}ude/x'" 'cat "{~/.cla,x}ude/x"' 'cat \{~/.cla,x\}ude/x'; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "cwd repo, quoted braces parsed again: $c" || return 1
   done
   _tool work Task prompt "post [$objs12] to the API"
   _allowed "free text in another tool" || return 1
@@ -831,7 +836,50 @@ test_quoted_braces_stay() { # R37: like bash, only braces outside quotes expand
     _blocked "personal (no grant): $c" || return 1
   done
   _sh personal "cat '{~/.claude-wo,x}rk/settings.json'" "$HOME/repo"
-  _allowed "personal (no grant): quoted braces stay" || return 1
+  _blocked "personal (no grant): quoted braces parsed again (R40 a)" || return 1
+}
+
+# ---- final review: R40 ----------------------------------------------------------
+
+test_quoted_one_word_braces_reparsed() { # R40 (a): a quoted word with { and , is parsed again, as code
+  t_two_profiles
+  mkdir -p "$HOME/repo"
+  local c g9='{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}'
+  for c in "bash -c '{~/.cla,x}ude/f'" "eval '{~/.cla,x}ude/f'" "trap '{~/.cla,x}ude/f' EXIT" \
+           "watch '{~/.cla,x}ude/f'" "ssh localhost '{~/.cla,x}ude/f'" 'bash -c "{~/.cla,x}ude/f"' \
+           "bash -c 'claude-{personal,x}'"; do
+    _sh work "$c" "$HOME/repo"
+    _blocked "cwd repo: $c" || return 1
+  done
+  _sh personal "bash -c '{~/.claude-wo,x}rk/f'" "$HOME/repo"
+  _blocked "personal runs a file in work (read grant only)" || return 1
+  _sh work "bash -c '$g9'" "$HOME/repo"
+  _guard_error "512 brace words in surely-code text" || return 1
+  _sh work "printf '%s' '$g9'" "$HOME/repo"
+  _allowed "512 brace words in only-maybe code: taken as written" || return 1
+}
+
+test_heredoc_body_soft_brace_cap() { # R40 (b): bash never brace-expands a heredoc body
+  t_two_profiles
+  mkdir -p "$HOME/repo"
+  local c i objs12='' nl=$'\n' tab=$'\t'
+  for i in $(seq 1 12); do objs12="$objs12{\"id\":$i,\"n\":\"a\"},"; done
+  objs12=${objs12%,}
+  for c in "cat > data.json <<'EOF'${nl}[$objs12]${nl}EOF" "cat > data.json <<EOF${nl}[$objs12]${nl}EOF" \
+           "cat <<-EOF > d.json${nl}${tab}[$objs12]${nl}${tab}EOF" "cat <<A - <<\"B\"${nl}x${nl}A${nl}[$objs12]${nl}B" \
+           "cat > d.json <<'EOF'${nl}[$objs12]${nl}EOF${nl}git add d.json"; do
+    _sh work "$c" "$HOME/repo"
+    _allowed "cwd repo: ${c:0:40}" || return 1
+  done
+  # the body ends at its delimiter line: what follows is a command again
+  _sh work "cat > d.json <<'EOF'${nl}[$objs12]${nl}EOF${nl}echo [$objs12]" "$HOME/repo"
+  _guard_error "a command after the body keeps the strict cap" || return 1
+  _sh work "cat <<'EOF'${nl}hi${nl}EOF${nl}cat {~/.cla,x}ude/f" "$HOME/repo"
+  _blocked "a command after the body is still checked" || return 1
+  _sh work "cat <<'EOF'${nl}{~/.cla,x}ude/x${nl}EOF" "$HOME/repo"
+  _blocked "paths in a body still count" || return 1
+  _sh work "echo \$((1<<2))${nl}echo [$objs12]" "$HOME/repo"
+  _guard_error "an arithmetic << starts no body" || return 1
 }
 
 test_recursive_ancestor_blocked() {

@@ -545,3 +545,98 @@ test_no_alarm_in_guard_modules() { # R27/R41: the supervisor's alarm is the only
   hits=$(cat "$REPO"/lib/ClaudeApart/*.pm | grep -v '^[[:space:]]*#' | grep -c 'alarm')
   assert_eq 0 "$hits" "alarm in lib/ClaudeApart" || return 1
 }
+
+# ---- final review: R55, new terminals, Keychain -----------------------------------
+
+test_typed_text_launcher_narrowed() { # R55 (1): only another profile's or an unknowable claude-<rest>
+  t_two_profiles
+  _herdr_std
+  _lines personal allow <<'EOF2' || return 1
+herdr pane run w2:p2 'claude-apart status'
+herdr pane run w2:p2 'claude-apart new personal ideas'
+herdr agent prompt rev 'claude-code docs say hi'
+herdr pane run w2:p2 'claude-nope -p hi'
+EOF2
+  _lines personal block <<'EOF2' || return 1
+herdr pane run w2:p2 'claude-apart sync'
+herdr pane run w2:p2 'claude-apart new work'
+herdr pane run w2:p2 'claude-apart --version'
+herdr pane run w2:p2 'claude- -p hi'
+herdr pane run w2:p2 'claude-$P'
+herdr pane run w2:p2 'cl\aude-work'
+herdr pane run w2:p2 'CLAUDE-PERSONAL -p hi'
+EOF2
+}
+
+test_env_clear_plain_words_by_name() { # R55 (2) as corrected: plain words by name, nested code by token
+  t_two_profiles
+  _herdr_std
+  _lines personal allow <<'EOF2' || return 1
+env -i PATH=/usr/bin git log --grep claude-ish
+env -i PATH=/usr/bin grep -n claude.md notes.txt
+echo exec -c claude
+herdr pane run w2:p2 'env -i PATH=/usr/bin git log --grep claude-ish'
+EOF2
+  _lines personal block <<'EOF2' || return 1
+env -i bash -c "claude -p hi"
+env -i bash -lc 'cd /tmp && claude -p hi'
+env -i /opt/bin/claude-work
+env -i CLAUDE -p hi
+env -i claude-$P
+env -i sh -c '{claude,x} -p hi'
+exec -c claude
+command exec -c claude-personal
+EOF2
+}
+
+test_new_terminal_launch_blocked() { # a new terminal, server or job loses this session's env
+  t_two_profiles
+  _herdr_std
+  _lines personal block <<'EOF2' || return 1
+tmux new-session -d "claude -p hi"
+osascript -e 'tell app "Terminal" to do script "claude -p hi"'
+screen -dmS x claude
+echo "claude -p hi" | at now
+launchctl submit -l x -- claude -p hi
+tmux new-session -d "claude-work -p hi"
+nohup tmux new -d 'cd /tmp && claude'
+sudo -u me tmux new -d claude
+bash -c 'zellij run -- claude'
+ssh localhost claude -p hi
+echo claude | ssh localhost
+printf 'claude -p hi\n' | batch
+systemd-run --user claude
+open -a Terminal claude
+echo '* * * * * claude -p hi' | crontab -
+herdr pane run w2:p2 'tmux new -d claude'
+herdr pane run w2:p2 'echo claude | at now'
+EOF2
+  _lines personal allow <<'EOF2' || return 1
+tmux new-session -d "claude-personal -p hi"
+tmux ls
+tmux new -d 'npm test'
+screen -ls
+at now < job.txt
+ssh localhost ls
+open https://example.com/claude.html
+git commit -m "run tmux new -d claude later"
+which tmux claude
+herdr pane run w2:p2 'tmux new -d claude-personal'
+EOF2
+}
+
+test_keychain_credentials_blocked() { # login tokens must not enter a transcript
+  t_two_profiles
+  _lines work block <<'EOF2' || return 1
+security find-generic-password -s "Claude Code-credentials" -w
+security find-generic-password -s "Claude Code-credentials-1a2b3c4d" -w
+/usr/bin/security find-generic-password -a me -s Claude\ Code-credentials -w
+bash -c 'security find-generic-password -s "Claude Code-credentials" -w'
+security dump-keychain | grep -A5 'Claude Code-credentials'
+EOF2
+  _lines work allow <<'EOF2' || return 1
+security list-keychains
+security find-generic-password -s other-service -w
+git commit -m "never run security find-generic-password -s Claude Code-credentials"
+EOF2
+}

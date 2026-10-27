@@ -352,14 +352,18 @@ sub _utf8 { my $c = $_[0] > 0x10FFFF ? 0xFFFD : $_[0]; my $s = chr($c); utf8::en
 # The same text written both ways counts as unquoted (more is checked).
 # Code in quotes (bash -c '…') is parsed again one level deeper, where its
 # own unquoted braces expand.
+# R40 (a): a quoted word with no other code in it ('{a,b}x') is parsed again
+# with $VIEW_OFF set: there every brace counts as unquoted, and nothing is
+# remembered, so the word keeps its quoted view one level up.
 my %VIEW;
+our $VIEW_OFF = 0;
 
 sub _inert { (my $v = $_[0]) =~ tr/{,}/\x1c\x1d\x1e/; return $v }
-sub brace_view { return exists $VIEW{ $_[0] } ? $VIEW{ $_[0] } : $_[0] }
+sub brace_view { return (!$VIEW_OFF && exists $VIEW{ $_[0] }) ? $VIEW{ $_[0] } : $_[0] }
 
 sub _remember_view {
     my ($w, $v) = @_;
-    return unless $w =~ /[{,}]/;
+    return if $VIEW_OFF || $w !~ /[{,}]/;
     $v = $w if $w =~ /[\x1c-\x1e]/;    # cannot tell apart: all unquoted
     my $old = $VIEW{$w};
     if (defined $old && $old ne $v) {   # merge: a brace is unquoted if it is in either
@@ -372,19 +376,53 @@ sub _remember_view {
     $VIEW{$w} = $v;
 }
 
+#
+# R40 (b): a heredoc body is data to bash (it never brace-expands one), so
+# its tokens get a third element: [text, is_operator, 1]. A body starts
+# after the newline that ends the line of its `<<WORD` (`<<-WORD` also strips
+# leading tabs) and ends at the first line that is exactly WORD (quotes
+# removed). Lines are never joined by a backslash here, so a body never ends
+# later than bash ends it. `<<` inside (( … )) is a shift, not a heredoc.
+# $in_body (internal): the text is a body; no heredocs in it.
 sub shell_words {
-    my ($s) = @_;
+    my ($s, $in_body) = @_;
     my @w;
     my ($cur, $view, $have) = ('', '', 0);
+    my @pending;                  # [delimiter, strip tabs] waiting for their body
+    my ($want, $arith) = (0, 0);  # want: [strip tabs] while the next word is a delimiter
     my $flush = sub {
-        if ($have) { push @w, [ $cur, 0 ]; _remember_view($cur, $view) }
+        if ($have) {
+            push @w, [ $cur, 0 ];
+            _remember_view($cur, $view);
+            push @pending, [ $cur, $want->[0] ] if $want;
+            $want = 0;
+        }
         ($cur, $view, $have) = ('', '', 0);
     };
     my $add = sub { $cur .= $_[0]; $view .= $_[1] ? _inert($_[0]) : $_[0]; $have = 1 };
     pos($s) = 0;
     while (pos($s) < length $s) {
-        if ($s =~ /\G([ \t\n\r\f\x0b]+)/gc) { $flush->(); push @w, [ "\n", 1 ] if index($1, "\n") >= 0 }
-        elsif ($s =~ /\G([;&|()<>`]+)/gc) { $flush->(); push @w, [ $1, 1 ] }
+        if ($s =~ /\G([ \t\n\r\f\x0b]+)/gc) {
+            my ($ws, $at) = ($1, $-[1]);
+            $flush->();
+            next if index($ws, "\n") < 0;
+            push @w, [ "\n", 1 ];
+            next unless @pending;
+            pos($s) = $at + index($ws, "\n") + 1;
+            push @w, _heredoc_body(\$s, @$_), [ "\n", 1, 1 ] for @pending;
+            @pending = ();
+        }
+        elsif ($s =~ /\G([;&|()<>`]+)/gc) {
+            my $op = $1;
+            $flush->();
+            push @w, [ $op, 1 ];
+            $want = 0;
+            next if $in_body;
+            $arith += () = $op =~ /\(\(/g;
+            $arith -= () = $op =~ /\)\)/g;
+            $arith = 0 if $arith < 0;
+            $want = [ $s =~ /\G-/gc ? 1 : 0 ] if !$arith && $op =~ /(?<!<)<<\z/;
+        }
         elsif ($s =~ /\G\\\n/gc) { }
         elsif ($s =~ /\G\\(.)/gcs) { $add->($1, 1) }
         elsif ($s =~ /\G\$'((?:[^'\\]+|\\.)*)'?/gcs) { $add->(_ansi_c($1), 1) }
@@ -399,6 +437,22 @@ sub shell_words {
     }
     $flush->();
     return @w;
+}
+
+# The tokens of one heredoc body read from pos($$sr), which then stands
+# after its delimiter line (or at the end of the text).
+sub _heredoc_body {
+    my ($sr, $delim, $tabs) = @_;
+    my $body = '';
+    while (pos($$sr) < length $$sr) {
+        $$sr =~ /\G([^\n]*)(\n?)/gc;
+        my ($line, $nl) = ($1, $2);
+        my $cmp = $line;
+        $cmp =~ s/\A\t+// if $tabs;
+        last if $cmp eq $delim;
+        $body .= $line . $nl;
+    }
+    return map { [ $_->[0], $_->[1], 1 ] } shell_words($body, 1);
 }
 
 # Words of a text: shell words (quotes removed) plus a plain split that also

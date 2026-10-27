@@ -48,7 +48,7 @@ my %EVAL_NAME  = map { $_ => 1 } qw(eval trap watch alias);
 # tasks add rules here.
 our @SHELL_RULES = (\&_rule_read_denied, \&_rule_write_denied, \&_rule_recursive_reader,
                     \&_rule_recursive_modifier, \&_rule_launcher, \&_rule_env, \&_rule_env_clear,
-                    \&_rule_herdr);
+                    \&_rule_herdr, \&_rule_new_terminal, \&_rule_keychain);
 
 sub verdict {
     my ($cfg, $profile, $tool, $input, $cwd) = @_;
@@ -73,6 +73,7 @@ sub _context {
         read    => ClaudeApart::Paths::root_set(@$rd),
         write   => ClaudeApart::Paths::root_set(@$wd),
         wonly   => ClaudeApart::Paths::root_set(grep { !$r{$_} } @$wd),
+        names   => { map { $_ => 1 } ClaudeApart::Config::profile_names($cfg) },
     };
 }
 
@@ -205,7 +206,7 @@ sub _analyse {
     my ($ctx, $cmd) = @_;
     my $sh = { text => $cmd, segments => [], memo => {} };
     @$sh{qw(dirs holes)} = _cd_dirs($ctx, $cmd);
-    _walk($ctx, $sh, $cmd, 0, 1);
+    _walk($ctx, $sh, $cmd, 0, 1, 1);
     $sh->{spellings} = [ ClaudeApart::Paths::uniq(
         map { map { @{ $_->{sp} } } @{ $_->{words} }, @{ $_->{redirects} } } @{ $sh->{segments} }) ];
     return $sh;
@@ -221,22 +222,26 @@ sub _nested {
 }
 
 sub _walk {
-    my ($ctx, $sh, $text, $depth, $exec) = @_;
+    my ($ctx, $sh, $text, $depth, $exec, $sure) = @_;
     my ($words, $redirs, $want_target) = ([], [], 0);
+    my (@wsoft, @rsoft);    # R40 (b): the word is in a heredoc body
     my $end = sub {
         return unless @$words || @$redirs;
         my @code = _code_flags($words);
         push @{ $sh->{segments} }, {
             exec      => $exec,
-            words     => [ map { _item($ctx, $sh, $words->[$_], $depth, $exec, $code[$_]) } 0 .. $#$words ],
-            redirects => [ map { _item($ctx, $sh, $_, $depth, $exec, 0) } @$redirs ],
+            code      => $sure,
+            words     => [ map { _item($ctx, $sh, $words->[$_], $depth, $exec, $sure, $code[$_], $wsoft[$_]) } 0 .. $#$words ],
+            redirects => [ map { _item($ctx, $sh, $redirs->[$_], $depth, $exec, $sure, 0, $rsoft[$_]) } 0 .. $#$redirs ],
         };
         ($words, $redirs) = ([], []);
+        @wsoft = @rsoft = ();
     };
     for my $t (ClaudeApart::Paths::shell_words($text)) {
-        my ($w, $op) = @$t;
+        my ($w, $op, $body) = @$t;
         unless ($op) {
-            if ($want_target) { push @$redirs, $w; $want_target = 0 } else { push @$words, $w }
+            if ($want_target) { push @$redirs, $w; push @rsoft, $body; $want_target = 0 }
+            else { push @$words, $w; push @wsoft, $body }
             next;
         }
         (my $rest = $w) =~ s/&?[<>]+[&|]?//g;
@@ -247,16 +252,34 @@ sub _walk {
 }
 
 # Code inside a word that is only maybe code: past the brace cap, a word
-# there is taken as written instead of being an error (R37).
+# there is taken as written instead of being an error (R37). So is a word of
+# a heredoc body (R40 b). A segment is surely code (its `code` field) at
+# the top, and below when its word is surely code (see _code_flags) or holds
+# $(…) or backticks; a word that is only maybe code (a quoted message) gives
+# segments that are not (the new-terminal and Keychain rules skip those).
 sub _item {
-    my ($ctx, $sh, $w, $depth, $exec, $code) = @_;
+    my ($ctx, $sh, $w, $depth, $exec, $seg_code, $code, $body) = @_;
+    local $ClaudeApart::Paths::BRACE_SOFT = $body ? 1 : $ClaudeApart::Paths::BRACE_SOFT;
     my @sp = map { _piece($ctx, $sh, $_) } ClaudeApart::Paths::word_pieces($w);
     my $nested = _nested($w, $depth);
-    if ($nested) {
-        local $ClaudeApart::Paths::BRACE_SOFT = ($code || $w =~ /\$\(|`/) ? 0 : 1;
-        _walk($ctx, $sh, $w, $depth + 1, ($exec && $w =~ /\$\(|`/) ? 1 : 0);
+    my $braces = !$nested && _quoted_braces($w);
+    if ($nested || $braces) {
+        my $sure = ($code || $w =~ /\$\(|`/) ? 1 : 0;
+        local $ClaudeApart::Paths::BRACE_SOFT = $sure ? 0 : 1;
+        local $ClaudeApart::Paths::VIEW_OFF = $braces ? 1 : $ClaudeApart::Paths::VIEW_OFF;
+        _walk($ctx, $sh, $w, $depth + 1, ($exec && $w =~ /\$\(|`/) ? 1 : 0, ($seg_code && $sure) ? 1 : 0);
     }
-    return { w => $w, sp => [ ClaudeApart::Paths::uniq(@sp) ], nested => $nested };
+    return { w => $w, sp => [ ClaudeApart::Paths::uniq(@sp) ], nested => ($nested || $braces) ? 1 : 0 };
+}
+
+# R40 (a): a word whose { , } were quoted ('{a,b}x', with no other code
+# in it) is not brace expanded here, but a shell or eval that runs it as
+# code would expand them; so it is parsed again one level deeper (see
+# Paths $VIEW_OFF).
+sub _quoted_braces {
+    my ($w) = @_;
+    return 0 unless index($w, '{') >= 0 && index($w, ',') >= 0;
+    return ClaudeApart::Paths::brace_view($w) ne $w ? 1 : 0;
 }
 
 # For each word of a simple command: is it surely shell code (see %SHELL_NAME)?
@@ -797,19 +820,49 @@ sub _rule_launcher {
             # R65: capart.pl RUNS (command word, fed word, or the script of an
             # interpreter or runner); a plain mention (cat, grep, git add) passes.
             if ($w[$k] =~ $CAPART_WORD) {
-                return 1 if $k == $ci || _fed_words(\@w, $k);
-                return 1 if grep { $RUNS_SCRIPTS{ _name($w[$_]) // "" } } $ci .. $k - 1;
+                return 1 if $k == $ci || _fed_words(\@w, $k) || _runs_script(\@w, $ci, $k);
             }
             next unless $w[$k] =~ $CLAUDE_APART;
-            return 1 if index($w[$k], '=') >= 0 || _fed_words(\@w, $k);
-            next if $k == $#w;
-            my $sub = $w[ $k + 1 ];
-            next if $APART_SAFE{$sub};
-            return 1 if $sub =~ /\A-|[\$`]/ || index($sub, '{}') >= 0;
-            next unless $APART_CMD{$sub};
-            next if $sub eq 'new' && $k + 2 <= $#w && $w[ $k + 2 ] eq $own;
-            return 1;
+            return 1 if index($w[$k], '=') >= 0 || _fed_words(\@w, $k) || _apart_blocks($own, \@w, $k);
         }
+    }
+    return 0;
+}
+
+# R42: does the `claude-apart` at $k change profile setup (see _rule_launcher)?
+sub _apart_blocks {
+    my ($own, $w, $k) = @_;
+    return 0 if $k == $#$w;
+    my $sub = $w->[ $k + 1 ];
+    return 0 if $APART_SAFE{$sub};
+    return 1 if $sub =~ /\A-|[\$`]/ || index($sub, '{}') >= 0;
+    return 0 unless $APART_CMD{$sub};
+    return 0 if $sub eq 'new' && $k + 2 <= $#$w && $w->[ $k + 2 ] eq $own;
+    return 1;
+}
+
+# R67 (2): is the word at $k the script that the last interpreter or runner
+# before it (from the command word on) runs? Not when a real program option
+# comes between them: then the program is that option's text and the word
+# is a data file (`perl -ne '…' capart.pl`). perl -n or -p alone give no
+# program, nor does ruby -E (an encoding).
+my %PROGRAM_OPT = (
+    perl   => qr/\A-(?:[aclnpsStTuUwWX]|[0l][0-7]*)*[eE]\z/,
+    ruby   => qr/\A-[acdlnpsSvwy]*e\z/,
+    node   => qr/\A(?:-[ep]|--eval|--print)\z/,
+    python => qr/\A-[bBdEhiIOqRsSuvx]*c\z/,
+    shell  => qr/\A-[A-Za-z]*c[A-Za-z]*\z/,
+);
+my %RUNNER_KIND = ((map { $_ => 'shell' } qw(sh bash zsh dash ksh csh tcsh fish)),
+                   perl => 'perl', ruby => 'ruby', node => 'node', python => 'python', python3 => 'python');
+
+sub _runs_script {
+    my ($w, $ci, $k) = @_;
+    for (my $j = $k - 1; $j >= $ci; $j--) {
+        my $n = _name($w->[$j]) // next;
+        next unless $RUNS_SCRIPTS{$n};
+        my $re = $PROGRAM_OPT{ $RUNNER_KIND{$n} // '' } or return 1;    # xargs, parallel
+        return (grep { $_ =~ $re } @$w[ $j + 1 .. $k - 1 ]) ? 0 : 1;
     }
     return 0;
 }
@@ -834,25 +887,132 @@ sub _rule_env {
 # session's profile variables, so a later claude or claude-… word in the
 # same command would not know its profile. Blocked, also in code inside it
 # (env -i bash -c "claude …"). env -i without a claude word passes.
+# R55 (2) as corrected: a later word that holds code (or a brace group) is
+# matched by the token claude anywhere in it; any other later word only by
+# its name (see _launcher_name, the own profile included), so
+# `env -i … git log --grep claude-ish` passes. exec counts only as the
+# command word (see _word0).
 my $CLAUDE_TOKEN  = qr/(?<![\w.])claude(?![\w.])/i;
 my %ENV_VALUE_OPT = map { $_ => 1 } qw(-u -C -S -P --unset --chdir --split-string);
+my %KEYWORD       = map { $_ => 1 } qw(! { do then else elif if while until time command builtin);
 
 sub _rule_env_clear {
     my ($ctx, $sh) = @_;
     for my $seg (@{ $sh->{segments} }) {
-        return 1 if _env_clear_claude([ map { $_->{w} } @{ $seg->{words} } ]);
+        return 1 if _env_clear_claude($ctx, [ map { $_->{w} } @{ $seg->{words} } ]);
     }
     return 0;
 }
 
 sub _env_clear_claude {
-    my ($w) = @_;
+    my ($ctx, $w) = @_;
+    my $w0 = _word0($w);
     for my $j (0 .. $#$w) {
         my $n = _name($w->[$j]) // next;
-        next unless ($n eq 'env' || $n eq 'exec') && _clears_env($w, $j, $n eq 'exec');
-        return 1 if grep { $_ =~ $CLAUDE_TOKEN } @$w[ $j + 1 .. $#$w ];
+        next unless ($n eq 'env' || ($n eq 'exec' && $j == $w0)) && _clears_env($w, $j, $n eq 'exec');
+        for my $x (@$w[ $j + 1 .. $#$w ]) {
+            return 1 if ($x =~ $CODE || index($x, '{') >= 0) ? $x =~ $CLAUDE_TOKEN : _launcher_name($ctx, $x, 1);
+        }
     }
     return 0;
+}
+
+# The index of the first word the shell may run as a builtin: after VAR=…
+# words and shell keywords (with options right after them: time -p).
+sub _word0 {
+    my ($w) = @_;
+    my ($i, $kw) = (0, 0);
+    for (; $i < @$w; $i++) {
+        my $x = $w->[$i];
+        if ($KEYWORD{$x}) { $kw = 1; next }
+        next if $x =~ $ASSIGN || ($kw && $x =~ /\A-/);
+        last;
+    }
+    return $i;
+}
+
+# Is a word a claude launcher by its name: claude, or claude-<rest> where
+# the rest cannot be known (claude-, claude-$P, claude-{a,b}) or names a
+# configured profile (the own one only with $own_too)? Any letter case: the
+# macOS disk finds `CLAUDE` as `claude`.
+sub _launcher_name {
+    my ($ctx, $x, $own_too) = @_;
+    my $n = _name($x) // return 0;
+    return 1 if $n =~ /\Aclaude\z/i;
+    return 0 unless $n =~ /\Aclaude-(.*)\z/is;
+    my $rest = $1;
+    return 1 if $rest eq '' || $rest =~ /[\$`{]/;
+    my $p = lc $rest;
+    return 0 if !$own_too && $p eq $ctx->{profile};
+    return $ctx->{names}{$p} ? 1 : 0;
+}
+
+# Does a text hold, at any quoting depth, a word named like a launcher (see
+# _launcher_name)? A word with a brace group counts by the token claude.
+sub _names_launcher {
+    my ($ctx, $text, $own_too, $depth) = @_;
+    $depth ||= 0;
+    return 1 if _launcher_name($ctx, $text, $own_too);
+    return 1 if index($text, '{') >= 0 && $text =~ $CLAUDE_TOKEN;
+    return 0 unless $text =~ $CODE;
+    return $text =~ $CLAUDE_TOKEN ? 1 : 0 if $depth > 2 * $MAX_DEPTH;
+    for my $x (ClaudeApart::Paths::words($text)) {
+        return 1 if $x ne $text && _names_launcher($ctx, $x, $own_too, $depth + 1);
+    }
+    return 0;
+}
+
+# F6: a new terminal, a tmux or screen server, osascript, open, an at,
+# batch, cron or launchd job, ssh and systemd-run run their command without
+# this session's environment, so a plain claude there starts the default
+# profile (and claude-<other> another profile). Blocked: such a word (from
+# the command word on, not after which/type) with a later word named claude
+# or claude-<profile other than the own one>, at any quoting depth. at,
+# batch, crontab, ssh and osascript also read commands from stdin, and
+# xargs feeds words from it: there a launcher word anywhere in the command
+# blocks. Only surely-code segments count (a quoted message passes).
+my %NEW_TERM = map { $_ => 1 } qw(tmux screen zellij osascript open at batch crontab launchctl ssh systemd-run);
+my %READS_IN = map { $_ => 1 } qw(at batch crontab ssh osascript);
+
+sub _rule_new_terminal {
+    my ($ctx, $sh) = @_;
+    for my $seg (grep { $_->{code} } @{ $sh->{segments} }) {
+        return 1 if _new_terminal_blocks($ctx, [ map { $_->{w} } @{ $seg->{words} } ], $sh->{text});
+    }
+    return 0;
+}
+
+sub _new_terminal_blocks {
+    my ($ctx, $w, $all) = @_;
+    my $ci = _cmd_index($w);
+    my $fed = $ci < @$w && $FEEDS_ARGS{ _name($w->[$ci]) // '' };
+    for my $k ($ci .. $#$w) {
+        my $n = _name($w->[$k]) // next;
+        next unless $NEW_TERM{$n} && !_lookup_only($w, $k);
+        for my $x (@$w[ $k + 1 .. $#$w ]) { return 1 if _names_launcher($ctx, $x, 0) }
+        return 1 if ($READS_IN{$n} || $fed) && _names_launcher($ctx, $all, 0);
+    }
+    return 0;
+}
+
+# F7: every profile's login token is in the Keychain under "Claude
+# Code-credentials" (with a suffix for a CLAUDE_CONFIG_DIR profile). A
+# `security` command that names it would print a token into the transcript.
+# Other ways into the Keychain are a known limit.
+my $CREDENTIALS = qr/Claude\W{0,4}Code-credentials/i;
+
+sub _rule_keychain {
+    my ($ctx, $sh) = @_;
+    for my $seg (grep { $_->{code} } @{ $sh->{segments} }) {
+        return 1 if _keychain_blocks([ map { $_->{w} } @{ $seg->{words} } ], $sh->{text});
+    }
+    return 0;
+}
+
+sub _keychain_blocks {
+    my ($w, $all) = @_;
+    return 0 unless grep { (_name($_) // '') eq 'security' } @$w;
+    return (grep { $_ =~ $CREDENTIALS } @$w, $all) ? 1 : 0;
 }
 
 # Do the options after env (or exec) at $j clear the environment?
@@ -939,7 +1099,7 @@ sub _rule_herdr {
     my %readable = map { $_ => 1 } $own, @{ ClaudeApart::Config::profile($ctx->{cfg}, $own)->{can_read} };
     for my $c (@calls) {
         for my $e (@{ $c->{env} }) { return 1 if !defined $e || $e =~ /[\$`]|\AHERDR_/ }
-        for my $t (@{ $c->{text} }) { return 1 if _typed_blocks($own, $t, 0) }
+        for my $t (@{ $c->{text} }) { return 1 if _typed_blocks($ctx, $t, 0) }
         for my $l (@{ $c->{labels} }) {
             my $p = defined $l ? ClaudeApart::Herdr::profile_for_label($ctx->{cfg}, $l) : undef;
             return 1 unless defined $p && $p eq $own;
@@ -969,14 +1129,18 @@ sub _unknown_runner_before {
     return ($p !~ /\A-/ && !($k >= 2 && $w->[ $k - 2 ] =~ /\A-/)) ? 1 : 0;
 }
 
-# R54 (b, c): in each simple command of typed text (and of code inside
-# it), a command word named claude-… (after quotes and backslashes are
-# removed) must be the own launcher, so claude-$P, claude-${P:-x} and
-# cl\aude-work block; env -i / exec -c may not come before a claude word.
-# Plain `claude` resolves by the pane's workspace, which input already
-# checks.
+# R54 (b, c), R55 (1): in each simple command of typed text (and of code
+# inside it), a command word named claude-<rest> (after quotes and
+# backslashes are removed) blocks when the rest cannot be known or is not a
+# plain lowercase name (claude-$P, claude-${P:-x}, CLAUDE-PERSONAL), or
+# names another profile (cl\aude-work); claude-apart follows R42; any other
+# plain name passes (claude-code). env -i / exec -c may not come before a
+# claude word, and the new-terminal (F6) and Keychain (F7) rules apply as in
+# a Bash call. Plain `claude` resolves by the pane's workspace, which input
+# already checks.
 sub _typed_blocks {
-    my ($own, $text, $depth) = @_;
+    my ($ctx, $text, $depth) = @_;
+    my $own = $ctx->{profile};
     return 1 if $depth > $MAX_DEPTH;
     my @segs = ([]);
     for my $t (ClaudeApart::Paths::shell_words($text)) {
@@ -985,11 +1149,15 @@ sub _typed_blocks {
     for my $w (grep { @$_ } @segs) {
         my $ci = _cmd_index($w);
         my $n = $ci < @$w ? _name($w->[$ci]) // '' : '';
-        return 1 if $n =~ /\Aclaude-/i && $n ne "claude-$own";
-        return 1 if _env_clear_claude($w);
+        if ($n =~ $CLAUDE_APART) { return 1 if _apart_blocks($own, $w, $ci) }
+        elsif ($n =~ /\Aclaude-(.*)\z/is) {
+            my $rest = $1;
+            return 1 if $rest !~ /\A[a-z0-9-]+\z/ || ($rest ne $own && $ctx->{names}{$rest});
+        }
+        return 1 if _env_clear_claude($ctx, $w) || _new_terminal_blocks($ctx, $w, $text) || _keychain_blocks($w, $text);
         my @code = _code_flags($w);
         for my $i (0 .. $#$w) {
-            return 1 if ($code[$i] || $w->[$i] =~ $CODE) && _typed_blocks($own, $w->[$i], $depth + 1);
+            return 1 if ($code[$i] || $w->[$i] =~ $CODE) && _typed_blocks($ctx, $w->[$i], $depth + 1);
         }
     }
     return 0;
