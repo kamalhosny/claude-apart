@@ -709,33 +709,53 @@ sub _operands {
 my $CLAUDE_APART = qr{(?:\A|[=/])claude-apart\z}i;
 my $HERDR_WORD   = qr{(?:\A|[=/])herdr\z}i;
 my %APART_SAFE   = map { $_ => 1 } qw(status check help -h --help);
+my %APART_CMD    = map { $_ => 1 } qw(setup add remove login status check copy new sync uninstall help);
 my $ENV_NAME     = qr/CLAUDE_CONFIG_DIR|CLAUDE_APART_PROFILE|CLAUDE_CODE_CHILD_SESSION/;
 
+# Is the word at $k an argument of which, type or command -v/-V (a lookup,
+# not a run)?
+sub _lookup_only {
+    my ($w, $k) = @_;
+    for my $j (0 .. $k - 1) {
+        my $n = _name($w->[$j]) // next;
+        return 1 if $n eq 'which' || $n eq 'type';
+        return 1 if $n eq 'command' && grep { $w->[$_] =~ /\A-[A-Za-z]*[vV][A-Za-z]*\z/ } $j + 1 .. $k - 1;
+    }
+    return 0;
+}
+
 # Another profile's launcher: a word, or an a=b piece of one, named
-# claude-<other profile>. And R10: `claude-apart` followed by anything but
-# status, check, help, -h, --help or `new <own profile>` (the others write
-# into every profile's setup). A bare `claude-apart` only prints its usage,
-# and so does one followed by a plain path (`git add bin/claude-apart lib/x`):
-# the CLI takes its subcommand from fixed names only.
-# Glued after = (c=claude-apart) it may run later with any words: block.
+# claude-<other profile>, or claude-<rest> where the rest cannot be known
+# (claude-$p, claude-`…`, claude-{a,b}).
+# R42: `claude-apart` blocks when the next word is a known subcommand other
+# than status, check, help or `new <own profile>`; when it is an option other
+# than -h/--help, or cannot be known ($X, `…`); and when there is none
+# (xargs and -exec add words of their own), except as the argument of
+# which, type or command -v. Any other next word is a file, not a
+# subcommand (`git add bin/claude-apart README.md`). Glued after =
+# (c=claude-apart) it may run later with any words: block.
 sub _rule_launcher {
     my ($ctx, $sh) = @_;
     my $own = $ctx->{profile};
     my %other = map { $_ => 1 } grep { $_ ne $own } ClaudeApart::Config::profile_names($ctx->{cfg});
     for my $seg (@{ $sh->{segments} }) {
         my @it = @{ $seg->{words} };
+        my @w  = map { $_->{w} } @it;
         for my $k (0 .. $#it) {
             next if $it[$k]{nested};
-            for my $p (ClaudeApart::Paths::word_pieces($it[$k]{w})) {
+            for my $p (ClaudeApart::Paths::word_pieces($w[$k])) {
                 my $n = _name($p);
-                return 1 if defined $n && $n =~ /\Aclaude-(.+)\z/i && $other{ lc $1 };
+                next unless defined $n && $n =~ /\Aclaude-(.*)\z/is;
+                return 1 if $other{ lc $1 } || $1 eq '' || $1 =~ /[\$`{]/;
             }
-            next unless $it[$k]{w} =~ $CLAUDE_APART;
-            return 1 if index($it[$k]{w}, '=') >= 0;
-            next if $k == $#it;
-            my $sub = $it[ $k + 1 ]{w};
-            next if $APART_SAFE{$sub} || $sub =~ m{\A[A-Za-z0-9._~+-]*/[A-Za-z0-9._~+/-]*\z};
-            next if $sub eq 'new' && $k + 2 <= $#it && $it[ $k + 2 ]{w} eq $own;
+            next unless $w[$k] =~ $CLAUDE_APART;
+            return 1 if index($w[$k], '=') >= 0;
+            if ($k == $#w) { next if _lookup_only(\@w, $k); return 1 }
+            my $sub = $w[ $k + 1 ];
+            next if $APART_SAFE{$sub};
+            return 1 if $sub =~ /\A-|[\$`]/;
+            next unless $APART_CMD{$sub};
+            next if $sub eq 'new' && $k + 2 <= $#w && $w[ $k + 2 ] eq $own;
             return 1;
         }
     }
@@ -773,26 +793,43 @@ sub _own_assignment {
         eq ClaudeApart::Paths::fold(ClaudeApart::Paths::canon($own, '/')) ? 1 : 0;
 }
 
-# Herdr: a read needs every target in the own or a readable profile; input
-# (also rename, close, move) needs the own profile, and a new workspace
-# label may not name another profile or be unknown. A target that maps to
-# no profile, a failed or slow lookup, and a command for another server all
-# block. So does a command that changes the Herdr env the lookups rely on
-# (HERDR_SOCKET=…, unset HERDR_…); $HERDR_PANE_ID and the like may be read.
-# A herdr glued after = (h=herdr) may run later with any words: block.
+# Herdr. A read needs every target in the own or a readable profile; input
+# (also rename, close, move, stop) needs the own profile. A target that maps
+# to no profile, a failed or slow lookup, and a command for another server
+# all block. On every herdr call, of any kind:
+# - R45: a workspace label it writes must start with the own <emoji> <TAG>
+#   (with a label of no profile the wrapper falls back to the default);
+# - R46: no --env HERDR_… (or an --env that cannot be known), and no change
+#   of the Herdr env the lookups rely on (HERDR_SOCKET=…, unset HERDR_…);
+#   $HERDR_PANE_ID and the like may be read;
+# - R47: herdr runs in the open. Blocked: herdr glued after = (h=herdr),
+#   herdr with no words after it (xargs, -exec, a function), command words
+#   that cannot be known, and a herdr read or input command after a word
+#   that cannot be known ($H pane read …, "$(which herdr)" pane read …) or
+#   at the start of a command (the rest of `$(…) pane read …`).
+#   `which herdr`, `type herdr` and `command -v herdr` stay allowed.
 sub _rule_herdr {
     my ($ctx, $sh) = @_;
-    my @calls;
+    my ($any, @calls) = (0);
     for my $seg (@{ $sh->{segments} }) {
         my @it = @{ $seg->{words} };
+        my @w  = map { $_->{w} } @it;
         for my $k (0 .. $#it) {
-            next if $it[$k]{nested} || $it[$k]{w} !~ $HERDR_WORD;
-            return 1 if index($it[$k]{w}, '=') >= 0;
-            my $c = ClaudeApart::Herdr::parse_command([ map { $_->{w} } @it[ $k + 1 .. $#it ] ]);
-            push @calls, $c unless $c->{kind} eq 'other';
+            next if $it[$k]{nested};
+            if ($w[$k] !~ $HERDR_WORD) {
+                return 1 if ($k == 0 || $w[ $k - 1 ] =~ /[\$`]/)
+                    && ClaudeApart::Herdr::command_kind(@w[ $k .. $#w ]) ne 'other';
+                next;
+            }
+            $any = 1;
+            return 1 if index($w[$k], '=') >= 0;
+            if ($k == $#w) { next if _lookup_only(\@w, $k); return 1 }
+            my $c = ClaudeApart::Herdr::parse_command([ @w[ $k + 1 .. $#w ] ]);
+            return 1 if $c->{kind} eq 'unknown';
+            push @calls, $c;
         }
     }
-    return 0 unless @calls;
+    return 0 unless $any;
     for my $seg (@{ $sh->{segments} }) {
         for my $it (@{ $seg->{words} }, @{ $seg->{redirects} }) {
             return 1 if !$it->{nested} && $it->{w} =~ /(?<![\$\{])HERDR_/;
@@ -801,16 +838,17 @@ sub _rule_herdr {
     my $own = $ctx->{profile};
     my %readable = map { $_ => 1 } $own, @{ ClaudeApart::Config::profile($ctx->{cfg}, $own)->{can_read} };
     for my $c (@calls) {
+        for my $e (@{ $c->{env} }) { return 1 if !defined $e || $e =~ /[\$`]|\AHERDR_/ }
+        for my $l (@{ $c->{labels} }) {
+            my $p = defined $l ? ClaudeApart::Herdr::profile_for_label($ctx->{cfg}, $l) : undef;
+            return 1 unless defined $p && $p eq $own;
+        }
+        next if $c->{kind} eq 'other';
         return 1 if $c->{machine} || !@{ $c->{targets} };
         for my $t (@{ $c->{targets} }) {
             my $p = ClaudeApart::Herdr::profile_of_target($ctx->{cfg}, $t->[1], $t->[0]);
             return 1 unless defined $p;
             return 1 if $c->{kind} eq 'input' ? $p ne $own : !$readable{$p};
-        }
-        for my $l (@{ $c->{labels} }) {
-            return 1 unless defined $l;
-            my $p = ClaudeApart::Herdr::profile_for_label($ctx->{cfg}, $l);
-            return 1 if defined $p && $p ne $own;
         }
     }
     return 0;

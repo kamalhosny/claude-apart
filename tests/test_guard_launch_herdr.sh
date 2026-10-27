@@ -108,15 +108,17 @@ test_copy_blocked_in_session() {
   _blocks personal 'claude-apart copy personal work' || return 1
 }
 
-test_claude_apart_allowlist() { # only status, check, help, -h, --help and `new <own>`
+test_claude_apart_allowlist() { # R42: a known subcommand outside the allowlist, or no next word, or an option
   t_two_profiles
   _allows work 'claude-apart status' 'claude-apart check' 'claude-apart help' 'claude-apart -h' \
     'claude-apart --help' 'claude-apart new work ideas' 'claude-apart new work --cwd /tmp' \
-    'claude-apart' 'which claude-apart' 'git add bin/claude-apart lib/x tests/y.sh' \
-    'shellcheck bin/claude-apart libexec/claude-apart/wrapper.sh' || return 1
-  _blocks work 'claude-apart new personal ideas' 'claude-apart new' 'claude-apart remove personal' \
+    'which claude-apart' 'command -v claude-apart' 'type claude-apart' \
+    'git add bin/claude-apart README.md' 'git add bin/claude-apart lib/x tests/y.sh' \
+    'shellcheck bin/claude-apart libexec/claude-apart/wrapper.sh' 'claude-apart frobnicate' || return 1
+  _blocks work 'claude-apart' 'claude-apart --version' 'xargs claude-apart' 'echo sync | xargs claude-apart' \
+    'claude-apart new personal ideas' 'claude-apart new' 'claude-apart remove personal' \
     'claude-apart sync' 'claude-apart add extra' 'claude-apart login work' 'claude-apart setup' \
-    'claude-apart uninstall' 'claude-apart frobnicate' '/opt/x/bin/claude-apart sync' \
+    'claude-apart uninstall' 'claude-apart copy personal work' '/opt/x/bin/claude-apart sync' \
     'claude-apart "$(echo copy)" personal work' 'claude-apart status && claude-apart sync' \
     'bash -c "claude-apart sync"' 'CLAUDE-APART sync' 'c=claude-apart; $c sync' \
     'claude-apart ${X%/}' 'claude-apart "sy"nc' || return 1
@@ -223,7 +225,7 @@ test_herdr_env_changes_blocked() { # lookups use this process's Herdr env; a com
   _herdr_std
   _blocks work 'HERDR_SOCKET=/tmp/s herdr pane read w1:p1' 'unset HERDR_SOCKET; herdr pane read w1:p1' \
     'export HERDR_PANE_ID=w1:p1; herdr pane read --current' 'env -u HERDR_SOCKET herdr pane run w1:p2 ls' || return 1
-  _allows work 'HERDR_SOCKET=/tmp/s herdr pane list' || return 1
+  _blocks work 'HERDR_SOCKET=/tmp/s herdr pane list' || return 1    # R46: any herdr call
 }
 
 test_herdr_listing_allowed() {
@@ -261,12 +263,80 @@ test_herdr_relabel_and_move() { # a pane may not change profile by a new label, 
   _blocks personal 'herdr workspace rename w2 "🟧 WORK · x"' \
     'herdr workspace rename w2 "$LABEL"' 'herdr pane move w2:p1 --new-workspace --label "$(cat l)"' \
     'herdr pane move w2:p1 --new-workspace --label "🟧 WORK · x"' || return 1
-  _allows personal 'herdr workspace rename w2 "🟪 PERS · y"' 'herdr workspace rename w2 plain' \
-    'herdr pane move w2:p1 --new-workspace --label x' || return 1
+  _allows personal 'herdr workspace rename w2 "🟪 PERS · y"' \
+    'herdr pane move w2:p1 --new-workspace --label "🟪 PERS · z"' || return 1
+  _blocks personal 'herdr workspace rename w2 plain' 'herdr pane move w2:p1 --new-workspace --label x' || return 1    # R45
   _blocks work 'herdr pane move w1:p1 --tab w2:t1 --split right' 'herdr pane move w2:p1 --new-tab' \
     'herdr pane swap --source-pane w1:p1 --target-pane w2:p1' 'herdr agent attach rev' \
     'herdr agent rename rev x' 'herdr pane rename w2:p1 x' || return 1
   _allows work 'herdr pane move w1:p1 --new-tab --workspace w1 --no-focus' || return 1
+}
+
+test_herdr_label_must_be_own() { # R45: every workspace label herdr writes starts with the own <emoji> <TAG>
+  t_two_profiles
+  _herdr_std
+  _blocks personal 'herdr workspace rename w2 notes && herdr pane run w2:p2 "claude -p hi"' \
+    'herdr workspace rename w2 notes' 'herdr workspace rename w2 🟪 PERS · x' \
+    'herdr workspace rename w2 "🟪 PERS · x" extra' 'herdr workspace rename w2' 'herdr workspace create' \
+    'herdr workspace create --label notes --cwd /tmp' 'herdr workspace create --label "$L"' \
+    'herdr workspace create --label "🟧 WORK · x"' 'herdr worktree create --branch b' \
+    'herdr worktree create --branch b --label notes' 'herdr worktree open --path /tmp/wt --label "🟧 WORK · wt"' \
+    'herdr pane move w2:p1 --new-workspace' || return 1
+  _allows personal 'herdr workspace create --label "🟪 PERS · x" --cwd /tmp --no-focus' \
+    'herdr worktree create --branch b --label "🟪 PERS · b"' 'herdr worktree open --path /tmp/wt --label "🟪 PERS"' \
+    'herdr tab create --label notes' 'herdr pane move w2:p1 --new-tab --label notes' || return 1
+  _blocks work 'herdr workspace create --label "🟪 PERS · x"' || return 1
+}
+
+test_herdr_env_option_blocked() { # R46: --env HERDR_* (or an unknown --env) on any herdr call
+  t_two_profiles
+  _herdr_std
+  _blocks work 'herdr pane split --current --direction right --env HERDR_WORKSPACE_ID=w1' \
+    'herdr tab create --env=HERDR_PANE_ID=w1:p1' 'herdr workspace create --label "🟧 WORK · x" --env "$E"' \
+    'unset HERDR_SOCKET; herdr workspace list' || return 1
+  _allows work 'herdr workspace create --label "🟧 WORK · x" --env FOO=1' 'echo "$HERDR_PANE_ID"' || return 1
+}
+
+test_herdr_indirect_calls_blocked() { # R47
+  t_two_profiles
+  _herdr_std
+  _blocks work '$(command -v herdr) pane read w2:p1' 'H=$(command -v herdr); $H pane read w2:p1' \
+    'CMD="pane read w2:p1"; herdr $CMD' 'echo pane read w2:p1 | xargs herdr' \
+    'f() { herdr "$@"; }; f pane read w2:p1' '${HB:-herdr} pane read w2:p1' 'herdr pane "$V" w2:p1' \
+    '"$(which herdr)" agent prompt me hi' '`which herdr` pane run w1:p2 ls' 'herdr' \
+    'find . -name x -exec herdr {} \;' 'herdr terminal session $X w1:p1' || return 1
+  _allows work 'which herdr' 'command -v herdr' 'command -V herdr' 'type herdr' 'type -a herdr' \
+    'ls -l "$(command -v herdr)"' || return 1
+}
+
+test_herdr_terminal_and_other_groups() {
+  t_two_profiles
+  _herdr_std
+  _blocks work 'herdr terminal session observe w2:p1' 'herdr terminal attach t5' \
+    'herdr terminal session observe rev' 'herdr terminal session control w1:p1 --frobnicate' || return 1
+  _allows work 'herdr terminal session observe w1:p1 --cols 80 --rows 24' \
+    'herdr terminal session control w1:p1 --takeover' 'herdr terminal title set x' || return 1
+  _allows personal 'herdr terminal session observe w1:p1' || return 1    # read grant
+  _blocks personal 'herdr terminal session control w1:p1' 'herdr terminal attach w1:p1' || return 1
+  _blocks work 'herdr server stop' 'herdr session stop main' 'herdr session delete main' \
+    'herdr session attach main' 'herdr integration install claude' 'herdr integration uninstall claude' \
+    'herdr api snapshot' 'herdr worktree remove --workspace w2' || return 1
+  _allows work 'herdr session list' 'herdr api schema --json' 'herdr worktree list' 'herdr integration status' \
+    'herdr worktree remove --workspace w1 --force' 'herdr notification show done --sound done' || return 1
+}
+
+test_launcher_name_from_variable() { # claude-<rest> where the rest cannot be known
+  t_two_profiles
+  _blocks work 'for p in personal; do claude-$p -p x; done' 'claude-${P} -p x' 'claude-`echo personal` -p x' \
+    '"claude-$(echo personal)" -p x' 'claude-{personal,x} -p x' || return 1
+  _allows work 'ls ~/.local/share/claude-apart/bin/claude-*' 'claude-work -p x' || return 1
+}
+
+test_agent_explain_file_is_other() { # explain --file reads a file, not a pane
+  t_two_profiles
+  _herdr_std
+  _allows work 'herdr agent explain --file /tmp/d.txt --agent claude --json' || return 1
+  _blocks work 'herdr agent explain rev --file /tmp/d.txt' || return 1
 }
 
 # ---- timeouts -------------------------------------------------------------------

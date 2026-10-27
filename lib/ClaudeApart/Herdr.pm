@@ -107,15 +107,26 @@ sub agent_pane {
 
 # ---- parsing herdr commands ---------------------------------------------------
 
-# Read kinds show a pane's content; input kinds type into a pane or change
-# which profile a pane belongs to (rename, close, move). Everything else
-# (list, get, create, split, focus, …) is "other".
+# Read kinds show a pane's content. Input kinds type into a pane, change
+# which profile a pane belongs to (rename, close, move), or stop panes and
+# agent setups of every profile (server, session, integration). Everything
+# else (list, get, create, split, focus, …) is "other". A key is the two or
+# three command words after `herdr`.
 my %KIND = (
-    (map { $_ => 'read' } 'pane read', 'pane wait-output', 'agent read', 'agent wait', 'agent explain'),
+    (map { $_ => 'read' } 'pane read', 'pane wait-output', 'agent read', 'agent wait', 'agent explain',
+        'terminal session observe', 'api snapshot'),
     (map { $_ => 'input' } 'pane run', 'pane send-keys', 'pane send-text', 'pane close', 'pane rename',
         'pane move', 'pane swap', 'agent prompt', 'agent send-keys', 'agent start', 'agent rename',
-        'agent attach', 'workspace rename', 'workspace close', 'tab rename', 'tab close'),
+        'agent attach', 'workspace rename', 'workspace close', 'tab rename', 'tab close',
+        'terminal session control', 'terminal attach', 'worktree remove', 'session attach',
+        'session stop', 'session delete', 'server stop', 'integration install', 'integration uninstall'),
 );
+# What the first positional after the command words names. Other nouns
+# (session, integration, …) have no target that maps to a profile.
+my %TYPE = (pane => 'pane', agent => 'agent', workspace => 'workspace', tab => 'tab', terminal => 'terminal');
+# Commands that write a workspace label with --label (`workspace rename`
+# takes it as a positional; `pane move` only with --new-workspace).
+my %LABEL_OPT = map { $_ => 1 } 'workspace create', 'worktree create', 'worktree open';
 # Options that take a value, and the kind of id the id options name.
 my %ID_OPT = ('--pane' => 'pane', '--source-pane' => 'pane', '--target-pane' => 'pane',
               '--tab' => 'tab', '--workspace' => 'workspace');
@@ -123,10 +134,12 @@ my %VALUE_OPT = map { $_ => 1 } keys %ID_OPT, qw(--session --machine --remote --
     --direction --amount --source --lines --format --right-click --ratio --cwd --env --split --label
     --tab-label --match --regex --timeout --agent --state --message --seq --agent-session-id
     --agent-session-path --applies-to-source --title --display-agent --state-label --token
-    --clear-token --ttl-ms --until --kind --file);
+    --clear-token --ttl-ms --until --kind --file --cols --rows --branch --base --path --body
+    --position --sound --output);
 my %FLAG_OPT = map { $_ => 1 } qw(--current --toggle --on --off --focus --no-focus --new-tab
     --new-workspace --raw --ansi --clear --clear-title --clear-display-agent --clear-state-labels
-    --wait --takeover --json --verbose --group --handoff --help -h);
+    --wait --takeover --json --verbose --group --handoff --force --trust-repository --outdated-only
+    --help -h);
 my %REMOTE = map { $_ => 1 } qw(--machine --session --remote);    # another server: ids mean other panes
 
 # A word as herdr gets it: $HERDR_PANE_ID, $HERDR_TAB_ID and
@@ -141,17 +154,36 @@ sub _value {
     return $w =~ /[\$`]/ ? undef : $w;
 }
 
+# The kind of the command words at the start of @words, and how many there
+# are (3 or 2).
+sub _kind {
+    my @p = @_;
+    for my $n (3, 2) {
+        next if @p < $n;
+        my $k = $KIND{ join ' ', @p[ 0 .. $n - 1 ] };
+        return ($k, $n) if $k;
+    }
+    return ('other', 2);
+}
+
+# The kind (read, input or other) of the command words that start @_.
+sub command_kind { return (_kind(@_))[0] }
+
 # The words after `herdr`, as written (quotes removed). Returns
-#   kind    => 'read', 'input' or 'other';
+#   kind    => 'read', 'input', 'other', or 'unknown' when a command word
+#              cannot be known ($V, `…`, find's {}): that blocks;
 #   machine => true when the command goes to another server (--machine,
 #              --session, --remote);
 #   targets => [[type, id], …] for read and input kinds: the first
-#              positional (not for `agent start`, where it is a new name),
-#              every --pane/--source-pane/--target-pane/--tab/--workspace,
-#              and --current ($HERDR_PANE_ID). type is 'pane', 'agent',
-#              'tab' or 'workspace'; an undef id cannot be known (blocks);
+#              positional after the command words (not for `agent start`,
+#              where it is a new name), every --pane/--source-pane/
+#              --target-pane/--tab/--workspace, and --current
+#              ($HERDR_PANE_ID). type is 'pane', 'agent', 'tab',
+#              'workspace' or 'terminal'; an undef id cannot be known (blocks);
 #   target  => the first target id;
-#   labels  => new workspace labels the command sets (undef: cannot be known).
+#   labels  => the workspace labels the command writes (undef: cannot be
+#              known, or herdr picks one itself);
+#   env     => the --env values, as written.
 # An unknown option in a read or input command gives an undef target,
 # because it may take the next word as its value.
 sub parse_command {
@@ -177,30 +209,43 @@ sub parse_command {
         }
         push @pos, $w;
     }
-    my ($noun, $verb) = @pos;
-    my $kind = (defined $verb && $KIND{"$noun $verb"}) || 'other';
-    my %r = (kind => $kind, machine => $machine, targets => \@targets, labels => \@labels);
+    my %r = (machine => $machine, targets => \@targets, labels => \@labels,
+             env => [ @{ $opt{'--env'} || [] } ]);
+    my $head = (($pos[0] // '') eq 'terminal' && ($pos[1] // '') eq 'session') ? 3 : 2;
+    my @head = @pos > $head ? @pos[ 0 .. $head - 1 ] : @pos;
+    if (grep { /[\$`]/ || $_ eq '{}' } @head) {
+        $r{kind} = 'unknown';
+        return \%r;
+    }
+    my ($kind, $n) = _kind(@pos);
+    my $cmd = @pos >= 2 ? "$pos[0] $pos[1]" : '';
+    $kind = 'other' if $cmd eq 'agent explain' && $opt{'--file'} && @pos <= $n;    # reads a file
+    $r{kind} = $kind;
+    if ($cmd eq 'workspace rename') {
+        push @labels, @pos == 4 ? _value($pos[3]) : undef;
+    } elsif ($LABEL_OPT{$cmd} || ($cmd eq 'pane move' && $opt{'--new-workspace'})) {
+        push @labels, map { defined $_ ? _value($_) : undef } @{ $opt{'--label'} || [undef] };
+    }
     return \%r if $kind eq 'other';
-    my $first = $pos[2];
-    if (defined $first && "$noun $verb" ne 'agent start') {
-        push @targets, [ $noun, _value($first) ];
+    my $first = $pos[$n];
+    if (defined $first && $cmd ne 'agent start') {
+        my $type = $TYPE{ $pos[0] };
+        push @targets, [ $type, defined $type ? _value($first) : undef ];
     }
     for my $o (sort keys %ID_OPT) {
         push @targets, map { [ $ID_OPT{$o}, defined $_ ? _value($_) : undef ] } @{ $opt{$o} || [] };
     }
     push @targets, [ 'pane', _value('$HERDR_PANE_ID') ] if $opt{'--current'};
     push @targets, [ undef, undef ] if $unknown;
-    push @labels, _value($pos[3]) if "$noun $verb" eq 'workspace rename' && defined $pos[3];
-    push @labels, map { defined $_ ? _value($_) : undef } @{ $opt{'--label'} || [] }
-        if "$noun $verb" eq 'pane move' && $opt{'--new-workspace'};
     $r{target} = @targets ? $targets[0][1] : undef;
     return \%r;
 }
 
 # The profile a target belongs to (by its workspace's label), or undef.
-# $type: 'workspace', 'tab', 'pane' or 'agent' (default). A tab or pane id
-# names its workspace before the ":"; an agent name (also in a pane place)
-# is looked up with `herdr agent get`.
+# $type: 'workspace', 'tab', 'pane', 'terminal' or 'agent' (default). A tab
+# or pane id names its workspace before the ":"; an agent name (also in a
+# pane place) is looked up with `herdr agent get`. A terminal target must
+# be a pane id.
 sub profile_of_target {
     my ($cfg, $id, $type) = @_;
     my $ws = _workspace_of($id, $type // 'agent');
@@ -213,6 +258,7 @@ sub _workspace_of {
     return undef unless defined $id;
     return $id =~ /\A$WS\z/ ? $id : undef if $type eq 'workspace';
     return $id =~ $TAB ? $1 : undef if $type eq 'tab';
+    return $id =~ $PANE ? $1 : undef if $type eq 'terminal';
     return undef unless $type eq 'pane' || $type eq 'agent';
     return $1 if $id =~ $PANE;
     my $p = agent_pane($id);

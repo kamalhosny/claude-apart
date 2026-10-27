@@ -155,3 +155,14 @@ test_config_owned_paths_tmp() {
   assert_contains "$OUT" "W:/tmp/claude-$uid"$'\n' "work: shared root write-denied" || return 1
   assert_contains "$OUT" "W:$cache" "work: cache write-denied" || return 1
 }
+
+test_harness_temp_base() { # R48: the suite's temp base is never under /tmp/claude-<uid>, in any spelling
+  local uid; uid=$(id -u)
+  ln -s /tmp "$T/l"
+  assert_eq "$T" "$(TMPDIR=$T _t_base)" "a normal folder is used" || return 1
+  assert_eq /var/tmp "$(TMPDIR=/tmp/claude-$uid _t_base)" "the root itself" || return 1
+  assert_eq /var/tmp "$(TMPDIR=/private/tmp/claude-$uid/x _t_base)" "/private spelling" || return 1
+  assert_eq /var/tmp "$(TMPDIR=$T/l/claude-$uid _t_base)" "through a symlink" || return 1
+  assert_eq /var/tmp "$(TMPDIR=$T/missing _t_base)" "a folder that is not there" || return 1
+  case "$T" in /tmp/claude-$uid/*|/private/tmp/claude-$uid/*) echo "T is under the session temp root"; return 1;; esac
+}

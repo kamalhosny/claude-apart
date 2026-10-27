@@ -9,7 +9,7 @@ for f in "${files[@]}"; do
   . "$f"
   for fn in $(declare -F | sed -n 's/^declare -f \(test_[A-Za-z0-9_]*\)$/\1/p'); do
     total=$((total + 1))
-    log=$(mktemp "${TMPDIR:-/tmp}/capart-log.XXXXXX")
+    log=$(mktemp "$(_t_base)/capart-log.XXXXXX")
     (
       t_setup || exit 1
       trap 'rm -rf "$T"' EXIT
