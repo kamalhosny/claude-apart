@@ -9,7 +9,7 @@
 # inside another profile's folder, and only a folder that looks like a Claude
 # config folder. A missing folder is fine (CA_REAL is empty).
 _ca_dir_deletable() { # <name> <dir>
-  local name=$1 d=$2 rel p o
+  local name=$1 d=$2 rel
   CA_REAL=
   ca_dir_plain "$d" || { ca_err "$d has a . or .. part; not deleting it."; return 1; }
   [ ! -L "$d" ] || { ca_err "$d is a link; not deleting it."; return 1; }
@@ -23,12 +23,8 @@ _ca_dir_deletable() { # <name> <dir>
     ca_err "$d does not look like a Claude config folder; not deleting it."
     CA_REAL=; return 1
   fi
-  for p in $(capart config profiles); do
-    [ "$p" = "$name" ] && continue
-    o=$(ca_profile_var "$p" DIR)
-    rel=$(capart path-rel "$CA_REAL" "$o") || return 1
-    [ "$rel" = none ] || { ca_err "$d overlaps the folder of profile $p; not deleting it."; CA_REAL=; return 1; }
-  done
+  # shared with add: other profiles' folders, protect entries, temp folders
+  ca_dir_conflict "$CA_REAL" "$name" 0 || { ca_err "not deleting $d."; CA_REAL=; return 1; }
   return 0
 }
 
@@ -88,8 +84,11 @@ ca_remove() {
 
   if [ "$delete" = 1 ] && [ "$prc" = 0 ]; then
     # checked again right before the delete, and the checked path is deleted
-    if _ca_dir_deletable "$name" "$dir" && [ -n "$CA_REAL" ]; then
-      rm -rf -- "$CA_REAL" && echo "Deleted $dir."
+    if _ca_dir_deletable "$name" "$dir"; then
+      [ -z "$CA_REAL" ] || { rm -rf -- "$CA_REAL" && echo "Deleted $dir."; }
+    else
+      ca_err "the profile is removed, but the folder $dir was kept (it failed the safety check)."
+      rc=1
     fi
   elif [ -e "$dir" ]; then
     echo "The folder $dir was kept."

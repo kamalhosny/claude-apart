@@ -657,3 +657,122 @@ test_setup_fresh_without_claude_json_offers_adopt_and_logs_in() {
   assert_contains "$(cat "$FAKE_LOG")" "CONFIG_DIR=<unset> PROFILE= ARGS=auth login" "login for ~/.claude" || return 1
   assert_eq p@example.com "$(_cfg_value personal EMAIL)" "recorded" || return 1
 }
+
+# ---- round 2 ----
+
+test_add_refuses_trailing_space_dirs() {
+  t_two_profiles
+  export FAKE_LOGIN_EMAIL=n@example.com FAKE_LOGIN_ORG=org-n
+  _add_refused n --dir "$HOME/.claude " || return 1
+  _add_refused n --dir "$HOME/.claude-work " || return 1
+  _add_refused n --dir " $HOME/x" || return 1
+  [ -f "$HOME/.claude.json" ] && assert_contains "$(cat "$HOME/.claude.json")" p@example.com "identity file untouched" || return 1
+  run capart config add-profile n "dir=$HOME/.claude "
+  [ "$RC" != 0 ] || { echo "capart accepted an edge space"; return 1; }
+}
+
+test_add_refuses_owned_path_overlaps() {
+  t_two_profiles
+  export FAKE_LOGIN_EMAIL=n@example.com FAKE_LOGIN_ORG=org-n
+  capart config set-profile personal protect "$HOME/notes/private" || return 1
+  _add_refused n --dir "$HOME/notes" || return 1
+  _add_refused n --dir "$HOME/.claude.json.d" || return 1
+  _add_refused n --dir "$HOME/.local/state/claude-apart/tmp/personal" || return 1
+}
+
+test_remove_delete_dir_refuses_other_profiles_protect_path() {
+  t_two_profiles
+  capart config set default personal
+  mkdir -p "$HOME/notes/private"; echo '{}' > "$HOME/notes/settings.json"
+  capart config set-profile personal protect "$HOME/notes/private" || return 1
+  capart config set-profile work dir "$HOME/notes" || return 1
+  run bash -c "printf 'y\ny\n' | claude-apart remove work --delete-dir"
+  [ "$RC" != 0 ] || { echo "expected failure"; return 1; }
+  [ -d "$HOME/notes/private" ] || { echo "protected folder deleted"; return 1; }
+}
+
+test_add_root_dir_gets_a_clear_message() {
+  t_two_profiles
+  run claude-apart add n --dir / < /dev/null
+  assert_rc 1 "refused" || return 1
+  assert_contains "$ERR" "cannot be /" "message" || return 1
+  assert_not_contains "$ERR" "usage" "not the capart usage text" || return 1
+}
+
+# ---- R65 ----
+
+test_session_refuses_every_config_and_settings_write() {
+  t_two_profiles
+  local before; before=$(cat "$XDG_CONFIG_HOME/claude-apart/config")
+  local c
+  for c in "config set default personal" "config set-fields work.can_read=personal" \
+           "config set-profile work can_read personal" "config add-profile n" \
+           "config remove-profile personal" "profile-remove personal" \
+           "settings install --profile work" "settings uninstall --profile personal"; do
+    _in_work_session capart $c
+    [ "$RC" = 1 ] || { echo "not refused (rc $RC): $c"; return 1; }
+    assert_contains "$ERR" "cannot run inside Claude" "message for: $c" || return 1
+  done
+  assert_eq "$before" "$(cat "$XDG_CONFIG_HOME/claude-apart/config")" "config unchanged" || return 1
+  [ ! -e "$HOME/.claude/settings.json" ] || { echo "settings written"; return 1; }
+}
+
+test_outside_session_the_same_writes_work() {
+  t_two_profiles
+  run capart config set-fields work.can_read=personal
+  assert_rc 0 "set-fields" || return 1
+  run capart settings install --profile work
+  assert_rc 0 "settings install" || return 1
+  run capart profile-remove personal
+  assert_rc 0 "profile-remove" || return 1
+}
+
+test_session_identity_check_only_own() {
+  t_two_profiles
+  _in_work_session capart identity-check personal
+  [ "$RC" != 0 ] || { echo "expected refusal"; return 1; }
+  assert_not_contains "$OUT$ERR" "p@example.com" "no other email" || return 1
+  _in_work_session capart identity-check work
+  assert_rc 0 "own" || return 1
+}
+
+test_guard_blocks_running_capart() {
+  t_two_profiles
+  local c cap="$REPO/libexec/claude-apart/capart.pl"
+  for c in "perl ~/x/libexec/claude-apart/capart.pl config set-fields work.can_read=personal" \
+           "xargs perl $cap config set-fields a.b=c" "$cap config set default work" \
+           "cd /tmp && ./capart.pl status" "env perl -I lib $cap status" "bash $cap" \
+           "find . -exec perl $cap status ;" "echo x | xargs $cap" "FOO=1 perl $cap status"; do
+    pre_tool work Bash "{\"command\":$(_json_str "$c")}"
+    assert_rc 2 "blocked: $c" || return 1
+  done
+}
+
+test_guard_allows_plain_capart_mentions() {
+  t_two_profiles
+  local c cap="$REPO/libexec/claude-apart/capart.pl"
+  for c in "git add libexec/claude-apart/capart.pl" "grep -n session_allow libexec/claude-apart/capart.pl" \
+           "cat $cap" "ls -l $cap" "wc -l capart.pl"; do
+    pre_tool work Bash "{\"command\":$(_json_str "$c")}"
+    assert_rc 0 "allowed: $c" || return 1
+  done
+}
+
+# ---- R66 ----
+
+test_tool_tree_is_write_denied_for_every_profile() {
+  t_two_profiles
+  local root; root=$(cd "$REPO" && pwd -P)
+  local p
+  for p in work personal; do
+    pre_tool $p Edit "{\"file_path\":\"$root/lib/ClaudeApart/Guard.pm\",\"old_string\":\"a\",\"new_string\":\"b\"}"
+    assert_rc 2 "$p Edit" || return 1
+    pre_tool $p Write "{\"file_path\":\"$root/lib/ClaudeApart/Guard.pm\",\"content\":\"x\"}"
+    assert_rc 2 "$p Write" || return 1
+    pre_tool $p Read "{\"file_path\":\"$root/lib/ClaudeApart/Guard.pm\"}"
+    assert_rc 0 "$p Read" || return 1
+  done
+  run claude-apart sync
+  assert_contains "$(cat "$HOME/.claude-work/settings.json")" "Edit(/$root/**)" "deny rule in work settings" || return 1
+  assert_contains "$(cat "$HOME/.claude/settings.json")" "Edit(/$root/**)" "deny rule in personal settings" || return 1
+}

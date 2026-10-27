@@ -708,6 +708,8 @@ sub _operands {
 # holds nested code is skipped here: its own words are seen one level deeper.
 
 my $CLAUDE_APART = qr{(?:\A|[=/])claude-apart\z}i;
+my $CAPART_WORD   = qr{(?:\A|/)capart\.pl\z}i;
+my %RUNS_SCRIPTS  = map { $_ => 1 } qw(perl sh bash zsh dash ksh csh tcsh fish python python3 ruby node xargs parallel);
 my $HERDR_WORD   = qr{(?:\A|[=/])herdr\z}i;
 my %APART_SAFE   = map { $_ => 1 } qw(status check help -h --help);
 my %APART_CMD    = map { $_ => 1 } qw(setup add remove login status check copy new sync uninstall help);
@@ -791,6 +793,12 @@ sub _rule_launcher {
                 my $rest = $1;
                 return 1 if $other{ lc $rest };
                 return 1 if ($rest eq '' || $rest =~ /[\$`{]/) && ($k == $ci || _fed_words(\@w, $k));
+            }
+            # R65: capart.pl RUNS (command word, fed word, or the script of an
+            # interpreter or runner); a plain mention (cat, grep, git add) passes.
+            if ($w[$k] =~ $CAPART_WORD) {
+                return 1 if $k == $ci || _fed_words(\@w, $k);
+                return 1 if grep { $RUNS_SCRIPTS{ _name($w[$_]) // "" } } $ci .. $k - 1;
             }
             next unless $w[$k] =~ $CLAUDE_APART;
             return 1 if index($w[$k], '=') >= 0 || _fed_words(\@w, $k);

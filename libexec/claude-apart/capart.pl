@@ -54,6 +54,7 @@ sub cmd_config {
     my ($sub, @a) = @_;
     return usage() unless defined $sub;
     my $path = ClaudeApart::Config::config_path();
+    return 1 if $sub =~ /\A(?:set|set-fields|set-profile|add-profile|remove-profile)\z/ && session_no_write();
     if ($sub eq 'add-profile') {
         return usage() unless @a >= 1;
         my ($name, @kv) = @a;
@@ -87,6 +88,10 @@ sub cmd_config {
         return usage() unless @a == 2;
         ClaudeApart::Config::set_top($cfg, $a[0], $a[1]);
         ClaudeApart::Config::save($cfg, $path);
+    } elsif ($sub eq 'owned') {
+        return usage() unless @a == 1;
+        session_allow($cfg, $a[0]) or return 1;
+        print "$_\n" for ClaudeApart::Config::owned_paths($cfg, $a[0]);
     } elsif ($sub eq 'set-fields') {
         return usage() unless @a;
         my @specs;
@@ -117,6 +122,13 @@ sub session_allow {
     return 1 if defined $own && $own eq $name;
     print STDERR "claude-apart: inside Claude only this session's own profile can be read.\n";
     return 0;
+}
+
+# R65: nothing that writes the config or a profile's settings runs inside a session.
+sub session_no_write {
+    return 0 unless in_session();
+    print STDERR "claude-apart: this changes profile setup, so it cannot run inside Claude.\n";
+    return 1;
 }
 
 sub session_visible {
@@ -197,6 +209,7 @@ sub cmd_resolve {
 sub cmd_identity_check {
     my (@a) = @_;
     return usage() unless @a == 1;
+    session_allow(ClaudeApart::Config::load(ClaudeApart::Config::config_path()), $a[0]) or return 1;
     my ($st, $email) = ClaudeApart::Identity::check($a[0]);
     print "$email\n" if length $email;
     return $st eq "ok" ? 0 : $st eq "missing" ? 3 : 4;
@@ -222,6 +235,7 @@ sub cmd_settings {
     my ($sub, @a) = @_;
     my $profile;
     return usage() unless defined $sub && ($sub eq 'install' || $sub eq 'uninstall');
+    return 1 if session_no_write();
     while (@a) {
         my $f = shift @a;
         if ($f eq '--profile' && @a) { $profile = shift @a } else { return usage() }
@@ -337,6 +351,7 @@ sub cmd_status {
 sub cmd_profile_remove {
     my (@a) = @_;
     return usage() unless @a == 1;
+    return 1 if session_no_write();
     my $path = ClaudeApart::Config::config_path();
     my $old = ClaudeApart::Config::load($path);
     die "unknown profile: $a[0]\n" unless ClaudeApart::Config::profile($old, $a[0]);

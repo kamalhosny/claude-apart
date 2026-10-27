@@ -22,11 +22,12 @@ _ca_free_pick() {
 # rc 1 when a value has a newline or another control character.
 _ca_plain_text() { # <what> <value>
   case "$2" in *[[:cntrl:]]*) ca_err "$1 must not contain a newline or other control character."; return 1;; esac
+  case "$2" in [[:space:]]*|*[[:space:]]) ca_err "$1 must not start or end with a space."; return 1;; esac
   return 0
 }
 
 ca_add() {
-  local name dir= tag= emoji= colour= adopt=0 cfg had_cfg=0 abs p re='^[a-z][a-z0-9-]{0,30}$' fields rc
+  local name dir= tag= emoji= colour= adopt=0 cfg had_cfg=0 abs p re='^[a-z][a-z0-9-]{0,30}$' fields loaded
   [ $# -ge 1 ] || { echo "Usage: claude-apart add <name> [--dir D] [--tag T] [--emoji E] [--colour C] [--adopt]" >&2; return 2; }
   name=$1; shift
   while [ $# -gt 0 ]; do
@@ -62,6 +63,7 @@ ca_add() {
     case "$abs" in /*) ;; *) ca_err "the folder must be an absolute path (or start with ~/)."; return 1 ;; esac
     ca_dir_plain "$abs" || { ca_err "the folder must not have a . or .. part."; return 1; }
     abs=${abs%/}
+    [ -n "$abs" ] || { ca_err "the folder cannot be /."; return 1; }
     ca_dir_conflict "$abs" "" 0 || return 1
     case "$abs" in "$HOME"/*) dir="~/${abs#"$HOME"/}" ;; *) dir=$abs ;; esac
   fi
@@ -79,6 +81,13 @@ ca_add() {
   fields=("dir=$dir" "emoji=$emoji" "colour=$colour")
   [ -z "$tag" ] || fields[${#fields[@]}]="tag=$tag"
   capart config add-profile "$name" "${fields[@]}" || return 1
+  # the saved value is what counts: check the folder as it loads back, before any login
+  loaded=$(ca_profile_var "$name" DIR)
+  if [ "$adopt" = 1 ]; then
+    ca_dir_conflict "$loaded" "$name" 1
+  else
+    ca_dir_conflict "$loaded" "$name" 0
+  fi || { _ca_add_rollback "$name" "$had_cfg" "$cfg"; return 1; }
 
   if [ "$adopt" = 1 ]; then
     _ca_adopt_identity "$name" || { _ca_add_rollback "$name" "$had_cfg" "$cfg"; return 1; }

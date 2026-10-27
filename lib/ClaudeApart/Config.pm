@@ -24,6 +24,8 @@ sub _trim { my $s = shift; $s =~ s/^\s+//; $s =~ s/\s+$//; return $s }
 sub _check_text {
     my ($what, $v) = @_;
     die "$what must not contain a newline or other control character\n" if defined $v && $v =~ /[\x00-\x1f\x7f]/;
+    # Config::load trims every line, so edge spaces would change the value on the way back.
+    die "$what must not start or end with a space\n" if defined $v && $v =~ /\A\s|\s\z/;
 }
 
 sub _check_name {
@@ -163,6 +165,12 @@ sub owned_paths {
 
 sub _uniq { my %s; return grep { !$s{$_}++ } @_ }
 
+# The canonical folder this code runs from.
+sub tool_root {
+    require Cwd;
+    return Cwd::abs_path(dirname(dirname(dirname(Cwd::abs_path(__FILE__)))));
+}
+
 sub foreign_paths {
     my ($cfg, $name) = @_;
     my $me = profile($cfg, $name) or die "unknown profile: $name\n";
@@ -173,6 +181,8 @@ sub foreign_paths {
     }
     my $cdir = dirname(config_path());
     push @write, $cdir;
+    # R66: the installed tool tree (guard code included) is never writable from a session
+    push @write, tool_root();
     my %can = map { $_ => 1 } @{ $me->{can_read} };
     my @read;
     for my $o (profile_names($cfg)) {

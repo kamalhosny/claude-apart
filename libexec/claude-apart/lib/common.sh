@@ -64,18 +64,35 @@ ca_dir_plain() { # <path>
 # refused (symlinks, letter case and inodes are handled by capart path-rel).
 # <allow_claude>=1 lets the folder be ~/.claude itself (adopting). Message on stderr.
 ca_dir_conflict() { # <abs dir> <skip name> <allow_claude>
-  local d=$1 skip=$2 allow=$3 p o rel
+  local d=$1 skip=$2 allow=$3 p o rel overlap
+  case "$d" in /?*) ;; *) ca_err "that is not a usable folder path."; return 1;; esac
   rel=$(capart path-rel "$d" "$HOME") || return 1
   case "$rel" in same|contains) ca_err "that folder is, or holds, your home folder."; return 1;; esac
   if [ "$allow" != 1 ]; then
     rel=$(capart path-rel "$d" "$HOME/.claude") || return 1
     [ "$rel" = none ] || { ca_err "that folder overlaps ~/.claude, which belongs to the adopted profile."; return 1; }
   fi
+  # everything another profile owns: its folder, protect entries, temp folder,
+  # and for the adopted one the ~/.claude.json family
   for p in $(capart config profiles 2>/dev/null); do
     [ "$p" = "$skip" ] && continue
-    o=$(ca_profile_var "$p" DIR)
-    rel=$(capart path-rel "$d" "$o") || return 1
-    [ "$rel" = none ] || { ca_err "that folder overlaps the folder of profile $p."; return 1; }
+    while IFS= read -r o; do
+      [ -n "$o" ] || continue
+      overlap=0
+      case "$o" in
+        *.\*) # a family: the base file and every name that starts with "base."
+          o=${o%.\*}
+          case "$(printf %s "$d" | tr A-Z a-z)" in "$(printf %s "$o" | tr A-Z a-z)".*) overlap=1;; esac ;;
+      esac
+      rel=$(capart path-rel "$d" "$o") || return 1
+      [ "$rel" = none ] || overlap=1
+      if [ "$overlap" = 1 ]; then
+        ca_err "that folder overlaps the folder of profile $p (or a path it protects)."
+        return 1
+      fi
+    done <<EOF2
+$(capart config owned "$p")
+EOF2
   done
   return 0
 }
