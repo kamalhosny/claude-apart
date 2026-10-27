@@ -21,6 +21,10 @@ case "${1:-}" in
 esac
 
 case "${1:-}" in
+  sync) . "$CA_ROOT/libexec/claude-apart/cmd/sync.sh"; ca_sync; exit $? ;;
+esac
+
+case "${1:-}" in
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

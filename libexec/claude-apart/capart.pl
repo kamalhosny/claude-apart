@@ -188,6 +188,22 @@ sub cmd_statusline {
     return 0;
 }
 
+sub cmd_settings {
+    my ($sub, @a) = @_;
+    my $profile;
+    return usage() unless defined $sub && ($sub eq 'install' || $sub eq 'uninstall');
+    while (@a) {
+        my $f = shift @a;
+        if ($f eq '--profile' && @a) { $profile = shift @a } else { return usage() }
+    }
+    return usage() unless defined $profile;
+    require ClaudeApart::Settings;
+    my $cfg = ClaudeApart::Config::load(ClaudeApart::Config::config_path());
+    $sub eq 'install' ? ClaudeApart::Settings::install($cfg, $profile) : ClaudeApart::Settings::uninstall($cfg, $profile);
+    print $sub eq "install" ? "installed\n" : "uninstalled\n";
+    return 0;
+}
+
 my $cmd = shift @ARGV;
 unless (defined $cmd) { exit usage() }
 if ($cmd eq 'hook') {
@@ -204,6 +220,11 @@ if ($cmd eq 'config') {
 }
 if ($cmd eq "resolve" || $cmd eq "identity-check") {
     $rc = eval { $cmd eq "resolve" ? cmd_resolve(@ARGV) : cmd_identity_check(@ARGV) };
+    if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
+    exit $rc;
+}
+if ($cmd eq "settings") {
+    $rc = eval { cmd_settings(@ARGV) };
     if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
     exit $rc;
 }
