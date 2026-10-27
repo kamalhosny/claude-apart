@@ -261,7 +261,6 @@ test_caller_ca_vars_do_not_leak() {
   assert_contains "$(_log)" "CONFIG_DIR=$HOME/.claude-work" "own values used" || return 1
 }
 
-_mode() { if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi; }
 
 test_tmpdir_per_profile() {
   t_two_profiles
@@ -292,4 +291,76 @@ test_tmpdir_failure_refuses() {
   assert_rc 1 "refused" || return 1
   assert_contains "$ERR" "claude-apart: cannot create the temp folder $T/afile/sub/claude-apart/tmp/work." "message" || return 1
   assert_eq "" "$(_log)" "real claude not run" || return 1
+}
+
+# ---- final review ---------------------------------------------------------------
+
+test_herdr_explicit_launcher_in_other_profiles_workspace() { # F8, spec §10: profiles never share a workspace
+  t_two_profiles
+  _herdr_stub "🟪 PERS · x"
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude-work -p hi
+  assert_rc 1 "work in a personal workspace" || return 1
+  assert_eq "claude-apart: this Herdr workspace belongs to personal; start work in its own workspace (claude-apart new work)." "$ERR" "message" || return 1
+  assert_eq "" "$(_log)" "nothing started" || return 1
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude-personal
+  assert_rc 0 "own workspace" || return 1
+  assert_contains "$(_log)" "PROFILE=personal" "personal started" || return 1
+  : > "$FAKE_LOG"
+  _herdr_stub "plain"
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude-work
+  assert_rc 0 "a label with no profile prefix" || return 1
+  assert_contains "$(_log)" "PROFILE=work" "work started" || return 1
+  : > "$FAKE_LOG"
+  _herdr_stub "🟧 WORK · y"
+  HERDR_ENV=1 HERDR_WORKSPACE_ID=w9 run claude-work
+  assert_rc 0 "the own prefix" || return 1
+}
+
+test_provider_env_refused() { # F11: these send the session somewhere else than the profile login
+  t_two_profiles
+  local v
+  for v in CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_BASE_URL AWS_BEARER_TOKEN_BEDROCK; do
+    : > "$FAKE_LOG"
+    env "$v=1" "$T/bin/claude" >/dev/null 2>"$T/err"; RC=$?
+    [ "$RC" = 1 ] || { echo "$v: not refused (rc $RC)"; return 1; }
+    assert_eq "claude-apart: $v is set; it would bypass the profile login. Unset it, or pass --allow-api-key." "$(cat "$T/err")" "$v message" || return 1
+    assert_eq "" "$(_log)" "$v: nothing started" || return 1
+    env "$v=1" "$T/bin/claude" --allow-api-key hi >/dev/null 2>&1 || { echo "$v: override refused"; return 1; }
+    assert_contains "$(_log)" "ARGS=hi" "$v: override" || return 1
+    env "$v=" "$T/bin/claude" >/dev/null 2>&1 || { echo "$v: empty value refused"; return 1; }
+  done
+}
+
+test_missing_perl_stops_before_sourcing() { # F16
+  t_two_profiles
+  mkdir -p "$T/noperl" "$HOME/lib"
+  echo 'echo SOURCED-FROM-CWD' > "$HOME/lib/common.sh"
+  local s
+  for s in "$T/bin/claude" "$REPO/bin/claude-apart"; do
+    (cd "$HOME" && PATH="$T/noperl" "$s" status) >"$T/out" 2>"$T/err"; RC=$?
+    assert_rc 1 "$s without perl" || return 1
+    assert_eq "claude-apart: perl not found." "$(cat "$T/err")" "$s message" || return 1
+    assert_not_contains "$(cat "$T/out" "$T/err")" "SOURCED-FROM-CWD" "$s sourced nothing from the cwd" || return 1
+  done
+}
+
+test_find_real_claude_skips_other_installs() { # F17: two installs on PATH must not run each other
+  t_two_profiles
+  unset CLAUDE_APART_REAL_CLAUDE
+  mkdir -p "$T/other/libexec/claude-apart" "$T/other/bin" "$T/real"
+  cp "$REPO/libexec/claude-apart/wrapper.sh" "$T/other/libexec/claude-apart/wrapper.sh"
+  ln -s "$T/other/libexec/claude-apart/wrapper.sh" "$T/other/bin/claude"
+  ln -s "$REPO/tests/fixtures/fake-claude" "$T/real/claude"
+  PATH="$T/bin:$T/other/bin:$T/real:/usr/bin:/bin" run find_real_claude
+  assert_rc 0 "found" || return 1
+  assert_eq "$T/real/claude" "$OUT" "the real claude, past both wrappers" || return 1
+}
+
+test_duplicate_config_key_wrapper_says_why() { # F10
+  t_two_profiles
+  printf 'protect = ~/a\nprotect = ~/b\n' >> "$XDG_CONFIG_HOME/claude-apart/config"
+  run claude
+  assert_rc 1 "refused" || return 1
+  assert_contains "$ERR" "claude-apart: duplicate key 'protect' in [profile work] at line 18; put all values on one line." "reason" || return 1
+  assert_eq "" "$(_log)" "nothing started" || return 1
 }

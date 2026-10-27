@@ -51,6 +51,23 @@ test_config_rejects_bad_input() {
   assert_contains "$ERR" "syntax error" "syntax error" || return 1
 }
 
+test_config_rejects_duplicate_key() { # F10: a repeated key would hide the first value
+  t_two_profiles
+  local f="$XDG_CONFIG_HOME/claude-apart/config"
+  printf 'protect = ~/a\nprotect = ~/b\n' >> "$f"
+  run capart config profiles
+  [ "$RC" != 0 ] || { echo "expected failure"; return 1; }
+  assert_contains "$ERR" "claude-apart: duplicate key 'protect' in [profile work] at line 18; put all values on one line." "duplicate key message" || return 1
+  pre_tool work Read '{"file_path":"/etc/hosts"}'
+  assert_rc 2 "guard fails closed" || return 1
+  assert_contains "$ERR" "claude-apart: guard error — blocked to be safe." "guard error text" || return 1
+  printf 'default = work\ndefault = personal\n' > "$T/top"
+  cat "$f" >> "$T/top"; sed -i.bak '/^protect/d' "$T/top"; cp "$T/top" "$f"
+  run capart config profiles
+  [ "$RC" != 0 ] || { echo "top-level repeat accepted"; return 1; }
+  assert_contains "$ERR" "duplicate key 'default'" "top-level repeat" || return 1
+}
+
 test_config_foreign_paths() {
   t_two_profiles
   local code='use ClaudeApart::Config; my $c=ClaudeApart::Config::load(ClaudeApart::Config::config_path());

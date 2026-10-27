@@ -31,8 +31,12 @@ sub _root {
     return dirname(dirname(dirname($f)));
 }
 
-# `command -v perl`, or /usr/bin/perl.
+# The perl the hooks run with: /usr/bin/perl when it is there (F12: a perl
+# from a version manager, first on PATH, can change or vanish and then every
+# hook fails closed), else the first perl on PATH. `sync` re-pins.
+our $SYSTEM_PERL = '/usr/bin/perl';
 sub _perl {
+    return $SYSTEM_PERL if -f $SYSTEM_PERL && -x _;
     for my $d (split /:/, (defined $ENV{PATH} ? $ENV{PATH} : '')) {
         next unless length $d && $d =~ m{^/};
         return "$d/perl" if -f "$d/perl" && -x _;

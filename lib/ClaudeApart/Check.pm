@@ -111,6 +111,7 @@ sub _managed_file {
 }
 
 my %INSTALLED;    # profile -> { event -> installed command }, filled by check (a)
+my ($SCRATCH_EMAIL, $SCRATCH_ORG) = ('user@example.invalid', 'example');    # F15: check (g) identities
 
 sub _say {
     my ($ok, $profile, $text) = @_;
@@ -302,6 +303,8 @@ sub _check_scratch {
         my %raw = %{ $cfg->{profiles}{$n} };
         delete $raw{protect};
         $raw{dir} = $dir{$n} = $src->{adopted} ? '~/.claude' : "~/.claude-$n";
+        # F15: placeholder identities; the real emails and orgs never reach the scratch files
+        @raw{qw(email org)} = ($SCRATCH_EMAIL, $SCRATCH_ORG);
         push @{ $copy->{order} }, $n;
         $copy->{profiles}{$n} = \%raw;
     }
@@ -344,9 +347,9 @@ sub _check_scratch {
         unlink $idfile;
         push @fails, 'missing identity not refused by the wrapper' unless $wrapper->();
         push @fails, 'missing identity not blocked by hook prompt' unless $prompt->();
-        # control: the right identity is not refused (only when the profile records one)
-        if (length $p->{email} && length $p->{org}) {
-            $write->(JSON::PP->new->utf8->encode({ oauthAccount => { emailAddress => $p->{email}, organizationUuid => $p->{org} } }));
+        # control: the right (placeholder) identity is not refused
+        {
+            $write->(JSON::PP->new->utf8->encode({ oauthAccount => { emailAddress => $SCRATCH_EMAIL, organizationUuid => $SCRATCH_ORG } }));
             push @fails, 'matching identity was refused (control)' if $wrapper->();
             push @fails, 'matching identity blocked by hook prompt (control)' if $prompt->();
             if (defined $icmd) {

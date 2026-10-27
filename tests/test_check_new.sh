@@ -261,3 +261,27 @@ test_check_single_profile_clean_stderr() {
   assert_rc 0 "check" || return 1
   assert_eq "" "$ERR" "no stderr" || return 1
 }
+
+test_check_scratch_uses_placeholder_identities() { # F15: no real email or org in the scratch config
+  _synced || return 1
+  # the installed prompt command also saves the scratch config it runs against
+  local pre="cp \"\$HOME/.config/claude-apart/config\" '$T/scratch-config'; "
+  local f
+  for f in "$HOME/.claude-work/settings.json" "$HOME/.claude-work/.claude-apart-state.json"; do
+    PRE=$pre perl -MJSON::PP -e '
+      my $f = shift; local $/; open my $h, "<", $f or die; my $d = decode_json(<$h>); close $h;
+      if ($f =~ /state/) { $d->{hooks}{UserPromptSubmit} = $ENV{PRE} . $d->{hooks}{UserPromptSubmit} }
+      else { $_->{command} = $ENV{PRE} . $_->{command} for map { @{ $_->{hooks} } } @{ $d->{hooks}{UserPromptSubmit} } }
+      open $h, ">", $f or die; print $h encode_json($d); close $h' "$f"
+  done
+  run claude-apart check
+  [ -f "$T/scratch-config" ] || { echo "the scratch config was not captured"; printf '%s\n' "$OUT"; return 1; }
+  local s; s=$(cat "$T/scratch-config")
+  assert_not_contains "$s" "p@example.com" "no personal email" || return 1
+  assert_not_contains "$s" "w@example.com" "no work email" || return 1
+  assert_not_contains "$s" "org-p" "no personal org" || return 1
+  assert_not_contains "$s" "org-w" "no work org" || return 1
+  assert_contains "$s" "email = user@example.invalid" "placeholder email" || return 1
+  assert_contains "$s" "org = example" "placeholder org" || return 1
+  assert_contains "$OUT" "✓ work: wrong and missing identity refused (scratch copy)" "identity rules still pass" || return 1
+}

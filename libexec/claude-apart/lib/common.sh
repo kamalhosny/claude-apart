@@ -64,7 +64,7 @@ ca_dir_plain() { # <path>
 # refused (symlinks, letter case and inodes are handled by capart path-rel).
 # <allow_claude>=1 lets the folder be ~/.claude itself (adopting). Message on stderr.
 ca_dir_conflict() { # <abs dir> <skip name> <allow_claude>
-  local d=$1 skip=$2 allow=$3 p o rel overlap
+  local d=$1 skip=$2 allow=$3 p o rel overlap names owned cfgf
   case "$d" in /?*) ;; *) ca_err "that is not a usable folder path."; return 1;; esac
   rel=$(capart path-rel "$d" "$HOME") || return 1
   case "$rel" in same|contains) ca_err "that folder is, or holds, your home folder."; return 1;; esac
@@ -74,8 +74,15 @@ ca_dir_conflict() { # <abs dir> <skip name> <allow_claude>
   fi
   # everything another profile owns: its folder, protect entries, temp folder,
   # and for the adopted one the ~/.claude.json family
-  for p in $(capart config profiles 2>/dev/null); do
+  # R67 (4): a list we cannot read refuses (an empty list would pass everything)
+  cfgf=${XDG_CONFIG_HOME:-$HOME/.config}/claude-apart/config
+  names=
+  if [ -e "$cfgf" ] || [ -L "$cfgf" ]; then
+    names=$(capart config profiles) || { ca_err "cannot read the profile list; refusing to be safe."; return 1; }
+  fi
+  for p in $names; do
     [ "$p" = "$skip" ] && continue
+    owned=$(capart config owned "$p") || { ca_err "cannot read what profile $p owns; refusing to be safe."; return 1; }
     while IFS= read -r o; do
       [ -n "$o" ] || continue
       overlap=0
@@ -91,7 +98,7 @@ ca_dir_conflict() { # <abs dir> <skip name> <allow_claude>
         return 1
       fi
     done <<EOF2
-$(capart config owned "$p")
+$owned
 EOF2
   done
   return 0
@@ -103,22 +110,26 @@ ca_err() { echo "claude-apart: $*" >&2; }
 ca_wrapper() { echo "$CA_ROOT/libexec/claude-apart/wrapper.sh"; }
 
 # The real claude: $CLAUDE_APART_REAL_CLAUDE, else the first `claude` on PATH
-# that is not our wrapper (even through symlinks).
+# that is not our wrapper (even through symlinks), nor the wrapper of
+# another claude-apart copy on PATH (two installs would start each other).
 find_real_claude() {
   if [ -n "${CLAUDE_APART_REAL_CLAUDE:-}" ]; then
     echo "$CLAUDE_APART_REAL_CLAUDE"
     return 0
   fi
-  local w c dir oldifs=$IFS
+  local w c r dir oldifs=$IFS
   w=$(ca_wrapper)
   IFS=:
   for dir in $PATH; do
     IFS=$oldifs
     [ -n "$dir" ] || dir=.
     c=$dir/claude
-    if [ -f "$c" ] && [ -x "$c" ] && [ "$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$c")" != "$w" ]; then
-      echo "$c"
-      return 0
+    if [ -f "$c" ] && [ -x "$c" ]; then
+      r=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$c")
+      case "$r" in
+        "$w"|*/libexec/claude-apart/wrapper.sh) ;;
+        *) echo "$c"; return 0 ;;
+      esac
     fi
     IFS=:
   done

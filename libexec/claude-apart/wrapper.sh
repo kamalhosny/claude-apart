@@ -1,6 +1,11 @@
 #!/bin/bash
 # The `claude` command: picks the profile, checks the login, starts the real claude.
-. "$(dirname "$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0")")/lib/common.sh"
+# Without perl the path below would be empty and the source would read a file
+# relative to the current folder, so stop first.
+command -v perl >/dev/null 2>&1 || { echo "claude-apart: perl not found." >&2; exit 1; }
+_ca_self=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0") && [ -n "$_ca_self" ] \
+  || { echo "claude-apart: cannot find where this script lives." >&2; exit 1; }
+. "${_ca_self%/*}/lib/common.sh"
 
 cfgfile=${XDG_CONFIG_HOME:-$HOME/.config}/claude-apart/config
 if [ ! -f "$cfgfile" ]; then
@@ -17,6 +22,15 @@ done
 if [ "$allow_key" = 0 ] && { [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; }; then
   echo "claude-apart: an API key is set; it would bypass the profile login. Unset it, or pass --allow-api-key." >&2
   exit 1
+fi
+# Another provider or endpoint: the session would not use the profile's login either.
+if [ "$allow_key" = 0 ]; then
+  for v in CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_BASE_URL AWS_BEARER_TOKEN_BEDROCK; do
+    if [ -n "${!v:-}" ]; then
+      echo "claude-apart: $v is set; it would bypass the profile login. Unset it, or pass --allow-api-key." >&2
+      exit 1
+    fi
+  done
 fi
 
 self=$(basename "$0")

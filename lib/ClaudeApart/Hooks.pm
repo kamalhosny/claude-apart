@@ -11,7 +11,8 @@ use ClaudeApart::Herdr;
 # Exit 2 blocks (Claude Code treats every other code as allow), so every
 # failure becomes exit 2 with the fixed guard error text. Block messages are
 # fixed text: never a path, another profile's name or an email (the identity
-# text holds the own profile name). The time budget is
+# text holds the own profile name). One exception: the prompt @-mention block
+# repeats the path the user typed in that prompt. The time budget is
 # enforced by the supervisor process in capart.pl.
 
 our $BLOCK_TEXT = "claude-apart: blocked \xe2\x80\x94 this touches another profile.";
@@ -99,7 +100,47 @@ sub identity_block {
 
 sub prompt {
     my ($profile) = @_;
-    return identity_block($profile);
+    my $id = identity_block($profile);
+    return $id if defined $id;
+    # R75 (F9): Claude Code reads an @-mentioned file into the prompt by itself
+    # (no tool call, so the guard never sees it). Block a mention that resolves
+    # into what this profile may not read, judged like a Read of that path.
+    my $in = read_input();
+    my $text = $in->{prompt};
+    return undef unless defined $text && !ref $text && index($text, '@') >= 0;
+    my $cwd = (defined $in->{cwd} && !ref $in->{cwd} && $in->{cwd} =~ m{\A/}) ? $in->{cwd} : $ENV{HOME};
+    my $cfg = load_config($profile);
+    for my $m (at_mentions($text)) {
+        for my $p (_mention_forms($m)) {
+            next unless ClaudeApart::Guard::verdict($cfg, $profile, 'Read', { file_path => $p }, $cwd);
+            (my $show = $m) =~ s/[\x00-\x1f\x7f]/?/g;
+            $show = substr($show, 0, 200) . '...' if length $show > 200;
+            return "claude-apart: blocked \xe2\x80\x94 the prompt mentions \@$show, which this profile may not read.";
+        }
+    }
+    return undef;
+}
+
+# The @-mention tokens of a prompt: `@path` or `@"path with spaces"`, at the
+# start or after white space (so an email address is not one).
+sub at_mentions {
+    my ($t) = @_;
+    my @m;
+    while ($t =~ /(?:\A|(?<=\s))\@(?:"([^"\n]*)"|(\S+))/g) {
+        my $p = defined $1 ? $1 : $2;
+        push @m, $p if length $p;
+    }
+    return @m;
+}
+
+# A mention as written, without trailing punctuation, and without a #L line range.
+sub _mention_forms {
+    my ($m) = @_;
+    (my $a = $m) =~ s/[,.;:!?)\]}'"]+\z//;
+    my @f = ($m, $a);
+    push @f, map { (my $b = $_) =~ s/#L?\d[\d-]*\z//; $b } @f;
+    my %seen;
+    return grep { length $_ && !$seen{$_}++ } @f;
 }
 
 # SessionStart never blocks: every path ends in exit 0, whatever fails
@@ -117,6 +158,16 @@ sub session_start_main {
         die "no profile\n" unless defined $profile && length $profile;
         session_start($profile);
     };
+    # F14: a config or profile that cannot be loaded makes every tool call
+    # block (fail closed); say why once, at the start.
+    if (!defined $msgs) {
+        my $e = $@;
+        $e = 'unknown error' unless defined $e && length $e;
+        $e =~ s/ at \S+ line \d+\.?\n?\z//;
+        chomp $e;
+        $e =~ s/[\x00-\x1f\x7f]/ /g;
+        $msgs = ["claude-apart: the profile setup could not be loaded ($e), so every tool call is blocked. Run claude-apart check in a terminal."];
+    }
     if (ref $msgs eq 'ARRAY' && @$msgs) {
         my $json = eval { JSON::PP->new->utf8->canonical->encode({ systemMessage => join("\n", @$msgs) }) };
         print "$json\n" if defined $json;

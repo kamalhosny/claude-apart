@@ -45,7 +45,7 @@ sub load {
     my ($path) = @_;
     open my $fh, '<', $path or die "cannot read config $path: $!\n";
     my $cfg = empty();
-    my ($cur, $ln) = (undef, 0);
+    my ($cur, $ln, $sect, %seen) = (undef, 0, undef);
     while (my $line = <$fh>) {
         $ln++;
         $line =~ s/\r?\n\z//;
@@ -60,10 +60,16 @@ sub load {
             $cfg->{profiles}{$n} = {};
             push @{ $cfg->{order} }, $n;
             $cur = $cfg->{profiles}{$n};
+            ($sect, %seen) = ("profile $n");
             next;
         }
         $t =~ /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/ or die "config line $ln: syntax error: '$t'\n";
         my ($k, $v) = ($1, $2);
+        # F10: a repeated key would silently drop the first value.
+        if ($seen{$k}++) {
+            die "duplicate key '$k' in [$sect] at line $ln; put all values on one line.\n" if defined $sect;
+            die "duplicate key '$k' at line $ln; keep only one.\n";
+        }
         if ($cur) {
             die "config line $ln: unknown key '$k'\n" unless $FIELD{$k};
             $cur->{$k} = $v;
@@ -182,7 +188,18 @@ sub foreign_paths {
     my $cdir = dirname(config_path());
     push @write, $cdir;
     # R66: the installed tool tree (guard code included) is never writable from a session
-    push @write, tool_root();
+    my $root = tool_root();
+    push @write, $root;
+    # R19/R67 (3): also the literal CLAUDE_APART_HOME spelling when it is the
+    # same folder through a link (a canonical-only rule would miss that spelling).
+    my $lit = (defined $ENV{CLAUDE_APART_HOME} && length $ENV{CLAUDE_APART_HOME})
+        ? $ENV{CLAUDE_APART_HOME} : "$ENV{HOME}/.local/share/claude-apart";
+    $lit =~ s{/+\z}{};
+    if ($lit =~ m{^/} && $lit ne $root) {
+        require Cwd;
+        my $c = Cwd::abs_path($lit);
+        push @write, $lit if defined $c && $c eq $root;
+    }
     my %can = map { $_ => 1 } @{ $me->{can_read} };
     my @read;
     for my $o (profile_names($cfg)) {

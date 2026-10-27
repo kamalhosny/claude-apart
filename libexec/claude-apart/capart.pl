@@ -183,8 +183,10 @@ sub cmd_resolve {
             print STDERR "claude-apart: cannot start another profile from inside a session.\n";
             return 5;
         }
+        return 1 if defined $explicit && !herdr_workspace_ok($cfg, $explicit);
         $pick = $own;
     } elsif (defined $explicit) {
+        return 1 unless herdr_workspace_ok($cfg, $explicit);
         $pick = $explicit;
     } elsif (defined $ENV{CLAUDE_APART_PROFILE} && length $ENV{CLAUDE_APART_PROFILE}) {
         $pick = $ENV{CLAUDE_APART_PROFILE};
@@ -203,6 +205,20 @@ sub cmd_resolve {
         unless (defined $pick) { print STDERR "claude-apart: no profile to use (set a default).\n"; return 6 }
     }
     print "$pick\n";
+    return 0;
+}
+
+# F8, spec §10: two profiles never share a Herdr workspace. Inside a
+# workspace whose label carries another profile's prefix, an explicit
+# claude-<name> refuses. A label with no prefix, the own prefix, or a label
+# that cannot be read (R52) lets it start.
+sub herdr_workspace_ok {
+    my ($cfg, $name) = @_;
+    return 1 unless ($ENV{HERDR_ENV} || "") eq "1" && length($ENV{HERDR_WORKSPACE_ID} || "");
+    my $label = ClaudeApart::Herdr::workspace_label($ENV{HERDR_WORKSPACE_ID});
+    my $owner = defined $label ? ClaudeApart::Herdr::profile_for_label($cfg, $label) : undef;
+    return 1 unless defined $owner && $owner ne $name;
+    print STDERR "claude-apart: this Herdr workspace belongs to $owner; start $name in its own workspace (claude-apart new $name).\n";
     return 0;
 }
 
@@ -225,6 +241,10 @@ sub cmd_statusline {
         else { return usage() }
     }
     return usage() unless defined $profile;
+    # R63/R67 (1): inside a session only the session's own profile is shown.
+    if (in_session()) {
+        session_allow(ClaudeApart::Config::load(ClaudeApart::Config::config_path()), $profile) or return 1;
+    }
     my $in = do { local $/; <STDIN> };
     require ClaudeApart::Statusline;
     print ClaudeApart::Statusline::render($profile, $chain, defined $in ? $in : "");

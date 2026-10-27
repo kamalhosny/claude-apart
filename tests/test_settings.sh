@@ -51,11 +51,22 @@ test_hook_command_shape() { # R13
   assert_eq '"*"' "$(_jq "$w" '$d->{hooks}{PreToolUse}[0]{matcher}')" "matcher" || return 1
   c=$(_jq "$w" '$d->{statusLine}{command}')
   assert_not_contains "$c" "exit 2" "statusline has no suffix" || return 1
-  # a perl found first on PATH is the one written
+  # F12: the system perl wins over one first on PATH (a version manager's
+  # perl can change or vanish; /usr/bin/perl stays)
   mkdir -p "$T/pbin"; ln -s /usr/bin/perl "$T/pbin/perl"
   PATH="$T/pbin:$PATH" _install work
   c=$(_jq "$w" '$d->{hooks}{PreToolUse}[0]{hooks}[0]{command}')
-  assert_contains "$c" "'$T/pbin/perl' '-I" "perl from PATH" || return 1
+  assert_contains "$c" "'/usr/bin/perl' '-I" "system perl, not the PATH one" || return 1
+  assert_not_contains "$c" "pbin" "PATH perl not written" || return 1
+}
+
+test_perl_pin_falls_back_to_path() { # F12: no /usr/bin/perl, so the first perl on PATH
+  mkdir -p "$T/pbin"; ln -s /usr/bin/perl "$T/pbin/perl"
+  local code='$ClaudeApart::Settings::SYSTEM_PERL = shift; print ClaudeApart::Settings::_perl()'
+  PATH="$T/pbin:$PATH" run perl -I"$REPO/lib" -MClaudeApart::Settings -e "$code" "$T/no-such-perl"
+  assert_eq "$T/pbin/perl" "$OUT" "first perl on PATH" || return 1
+  run perl -I"$REPO/lib" -MClaudeApart::Settings -e 'print ClaudeApart::Settings::_perl()'
+  assert_eq /usr/bin/perl "$OUT" "system perl by default" || return 1
 }
 
 test_family_rules() {
@@ -180,6 +191,19 @@ test_symlinked_root_gets_both_spellings() { # R19
   assert_contains "$deny" "Edit(/$HOME/real-work/**)" "canonical spelling" || return 1
 }
 
+test_tool_root_both_spellings() { # R67 (3): R19 for the tool root (CLAUDE_APART_HOME through a link)
+  t_two_profiles
+  mkdir -p "$T/real"
+  cp -R "$REPO/lib" "$REPO/libexec" "$T/real/"
+  ln -s "$T/real" "$T/link"
+  local canon; canon=$(cd "$T/real" && pwd -P)
+  CLAUDE_APART_HOME="$T/link" run perl -I"$T/link/lib" "$T/link/libexec/claude-apart/capart.pl" settings install --profile work
+  assert_rc 0 "install" || return 1
+  local deny; deny=$(_jq "$HOME/.claude-work/settings.json" '$d->{permissions}{deny}')
+  assert_contains "$deny" "Edit(/$canon/**)" "canonical tool root" || return 1
+  assert_contains "$deny" "Edit(/$T/link/**)" "CLAUDE_APART_HOME spelling" || return 1
+}
+
 test_state_file_records_original() {
   t_two_profiles
   local w="$HOME/.claude-work/settings.json"
@@ -278,12 +302,17 @@ test_changed_perl_path_hooks_removed() {
   t_two_profiles
   local w="$HOME/.claude-work/settings.json"
   _install work
-  mkdir -p "$T/pbin"; ln -s /usr/bin/perl "$T/pbin/perl"
-  PATH="$T/pbin:$PATH" _install work
+  # an older install pinned another perl (the one first on PATH back then);
+  # a re-install (sync) re-pins to the system perl and leaves one entry
+  local old="$T/pbin/perl"
+  perl -pi -e "s{/usr/bin/perl}{$old}g" "$w" "$HOME/.claude-work/.claude-apart-state.json"
+  _install work
   assert_eq 1 "$(_jq "$w" 'scalar @{$d->{hooks}{PreToolUse}}')" "one entry after perl change" || return 1
-  assert_not_contains "$(cat "$w")" "'/usr/bin/perl'" "old perl gone" || return 1
+  assert_not_contains "$(cat "$w")" "$old" "old perl gone" || return 1
+  assert_contains "$(cat "$w")" "'/usr/bin/perl'" "re-pinned" || return 1
+  perl -pi -e "s{/usr/bin/perl}{$old}g" "$w"
   rm -f "$HOME/.claude-work/.claude-apart-state.json"
-  PATH="$T/pbin:$PATH" _uninstall work
+  _uninstall work
   assert_eq null "$(_jq "$w" '$d->{hooks}')" "hooks gone" || return 1
 }
 
@@ -317,12 +346,12 @@ test_file_modes() {
   local w="$HOME/.claude-work/settings.json"
   echo '{"model":"x"}' > "$w"; chmod 600 "$w"
   _install work
-  assert_eq 600 "$(stat -f %Lp "$w" 2>/dev/null || stat -c %a "$w")" "settings mode kept" || return 1
-  assert_eq 600 "$(stat -f %Lp "$w.claude-apart.bak" 2>/dev/null || stat -c %a "$w.claude-apart.bak")" "backup mode" || return 1
+  assert_eq 600 "$(_mode "$w")" "settings mode kept" || return 1
+  assert_eq 600 "$(_mode "$w.claude-apart.bak")" "backup mode" || return 1
   local s="$HOME/.claude-work/.claude-apart-state.json"
-  assert_eq 600 "$(stat -f %Lp "$s" 2>/dev/null || stat -c %a "$s")" "state mode" || return 1
+  assert_eq 600 "$(_mode "$s")" "state mode" || return 1
   _uninstall work
-  assert_eq 600 "$(stat -f %Lp "$w" 2>/dev/null || stat -c %a "$w")" "mode kept after uninstall" || return 1
+  assert_eq 600 "$(_mode "$w")" "mode kept after uninstall" || return 1
 }
 
 test_pre_tool_missing_script_blocks() { # R13: 127 becomes 2
@@ -365,4 +394,10 @@ test_existing_file_root_not_given_glob() { # Minor 6: existing path decides
   perl -I"$REPO/lib" "$CAPART" config set-profile personal protect "$HOME/protected.json"
   _install work
   assert_contains "$(_jq "$HOME/.claude-work/settings.json" '$d->{permissions}{deny}')" "Read(/$HOME/protected.json/**)" "directory named .json gets /**" || return 1
+}
+
+test_no_bsd_gnu_stat_chain_in_tests() { # F18: `stat -f` exists on Linux too (file system info), so the chain lies there
+  local hits; hits=$(grep -rnE 'stat -f[^|]*\|\| *stat -c' "$REPO/tests" || true)
+  assert_eq "" "$hits" "use _mode from tests/lib/assert.sh" || return 1
+  grep -q '^_mode()' "$REPO/tests/lib/assert.sh" || { echo "_mode is not in tests/lib/assert.sh"; return 1; }
 }

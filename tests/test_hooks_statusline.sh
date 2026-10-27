@@ -70,6 +70,29 @@ test_prompt_blocked_on_wrong_identity() {
   assert_rc 0 "prompt allowed when the login matches" || return 1
 }
 
+test_prompt_at_mention_of_denied_path_blocked() { # F9: @-mentions are read by Claude Code itself
+  t_two_profiles
+  mkdir -p "$HOME/proj/src"
+  local cwd; cwd=$(_json_str "$HOME/proj")
+  hook work prompt "{\"prompt\":\"look at @~/.claude/CLAUDE.md\",\"cwd\":$cwd}"
+  assert_rc 2 "@ of the adopted folder" || return 1
+  assert_contains "$ERR" "claude-apart: blocked — the prompt mentions @~/.claude/CLAUDE.md, which this profile may not read." "names the path" || return 1
+  hook work prompt "{\"prompt\":\"read @\\\"~/.claude/my notes.md\\\" now\",\"cwd\":$cwd}"
+  assert_rc 2 "quoted @ with spaces" || return 1
+  hook work prompt "{\"prompt\":\"@../.claude.json, please\",\"cwd\":$cwd}"
+  assert_rc 2 "relative @ into the identity file" || return 1
+  hook work prompt "{\"prompt\":\"email me@example.com\",\"cwd\":$cwd}"
+  assert_rc 0 "an email is not a mention" || return 1
+  hook work prompt "{\"prompt\":\"fix @src/x.rb\",\"cwd\":$cwd}"
+  assert_rc 0 "own project file" || return 1
+  hook work prompt "{\"prompt\":\"what is in ~/.claude/CLAUDE.md\",\"cwd\":$cwd}"
+  assert_rc 0 "plain mention without @ passes (the guard stops the tool calls)" || return 1
+  hook personal prompt "{\"prompt\":\"look at @~/.claude-work/CLAUDE.md\",\"cwd\":$cwd}"
+  assert_rc 0 "personal may read work (can_read)" || return 1
+  hook personal prompt "{\"prompt\":\"look at @~/.config/claude-apart/config\",\"cwd\":$cwd}"
+  assert_rc 2 "the config folder is denied to every profile" || return 1
+}
+
 test_pre_tool_blocked_on_wrong_identity() {
   _wrong_identity
   mkdir -p "$HOME/.claude-work"; echo hi > "$HOME/.claude-work/note"
@@ -121,6 +144,22 @@ test_session_start_never_blocks() {
   rm "$T/bin/herdr"
   _session_start work
   assert_rc 0 "no herdr at all" || return 1
+}
+
+test_session_start_says_why_the_setup_failed() { # F14: the user learns why every tool call will block
+  t_two_profiles
+  hook nosuch session-start '{"hook_event_name":"SessionStart"}'
+  assert_rc 0 "still exit 0" || return 1
+  assert_contains "$OUT" '"systemMessage"' "json message" || return 1
+  assert_contains "$OUT" "unknown profile" "the reason" || return 1
+  printf 'protect = ~/a\nprotect = ~/b\n' >> "$XDG_CONFIG_HOME/claude-apart/config"
+  hook work session-start '{"hook_event_name":"SessionStart"}'
+  assert_rc 0 "still exit 0" || return 1
+  assert_contains "$OUT" "duplicate key 'protect' in [profile work] at line 18" "config reason" || return 1
+  rm "$XDG_CONFIG_HOME/claude-apart/config"
+  hook work session-start '{"hook_event_name":"SessionStart"}'
+  assert_rc 0 "no config" || return 1
+  assert_contains "$OUT" '"systemMessage"' "missing config is reported" || return 1
 }
 
 test_statusline_badge() {

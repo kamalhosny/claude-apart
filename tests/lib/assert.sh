@@ -12,13 +12,16 @@ t_setup() {
   export HOME="$T/home"
   mkdir -p "$HOME" "$T/bin" "$T/prefix"
   export XDG_CONFIG_HOME="$HOME/.config"
+  # F19: never the user's own state/cache folders, whatever the outer shell set
+  export XDG_STATE_HOME="$T/state" XDG_CACHE_HOME="$T/cache"
   export CLAUDE_APART_HOME="$T/prefix"
   export CA_HOME="$CLAUDE_APART_HOME"
   export CLAUDE_APART_REAL_CLAUDE="$REPO/tests/fixtures/fake-claude"
   export FAKE_LOG="$T/fake.log"
   export PATH="$T/bin:$REPO/bin:/usr/bin:/bin"
   unset CLAUDE_CONFIG_DIR CLAUDE_APART_PROFILE CLAUDE_CODE_CHILD_SESSION CLAUDECODE
-  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL
+  unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY AWS_BEARER_TOKEN_BEDROCK
   unset CDPATH OLDPWD   # the guard reads both; a later cd sets OLDPWD again, not exported
   local v
   for v in $(env | sed -n 's/^\(HERDR_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
@@ -27,6 +30,11 @@ t_setup() {
   ln -s "$REPO/libexec/claude-apart/wrapper.sh" "$T/bin/claude-personal"
   ln -s "$REPO/libexec/claude-apart/wrapper.sh" "$T/bin/claude-work"
 }
+
+# Permission bits of a file as octal digits (e.g. 600). F18: GNU stat also
+# has -f (file system status), so trying stat -f first and falling back to
+# stat -c gives the wrong answer there.
+_mode() { if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi; }
 
 t_login_as() { # <identity-file> <email> <org>
   mkdir -p "$(dirname "$1")"

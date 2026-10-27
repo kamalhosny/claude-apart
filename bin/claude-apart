@@ -1,6 +1,11 @@
 #!/bin/bash
 # claude-apart: run several Claude Code accounts side by side.
-. "$(dirname "$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0")")/../libexec/claude-apart/lib/common.sh"
+# Without perl the path below would be empty and the source would read a file
+# relative to the current folder, so stop first.
+command -v perl >/dev/null 2>&1 || { echo "claude-apart: perl not found." >&2; exit 1; }
+_ca_self=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0") && [ -n "$_ca_self" ] \
+  || { echo "claude-apart: cannot find where this script lives." >&2; exit 1; }
+. "${_ca_self%/*}/../libexec/claude-apart/lib/common.sh"
 
 usage() {
   cat <<'USAGE'
@@ -23,7 +28,7 @@ case "${1:-}" in
 esac
 
 case "${1:-}" in
-  sync) . "$CA_ROOT/libexec/claude-apart/cmd/sync.sh"; ca_sync; exit $? ;;
+  sync) . "$CA_ROOT/libexec/claude-apart/cmd/sync.sh"; ca_sync; r=$?; ca_restart_note; exit $r ;;
   check) . "$CA_ROOT/libexec/claude-apart/cmd/check.sh"; shift; ca_check "$@"; exit $? ;;
   copy) . "$CA_ROOT/libexec/claude-apart/cmd/copy.sh"; shift; ca_copy "$@"; exit $? ;;
   new) . "$CA_ROOT/libexec/claude-apart/cmd/new.sh"; shift; ca_new "$@"; exit $? ;;
