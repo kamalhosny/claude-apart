@@ -3,21 +3,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 . "$REPO/libexec/claude-apart/lib/common.sh"
 export -n CA_ROOT CA_HOME
 
-# R48: the temp base for test folders. The adopted profile owns
-# /tmp/claude-<uid> (Claude Code's temp root, so $TMPDIR inside a session),
-# and a test HOME under it would be a foreign path for every other profile.
-# $TMPDIR (default /tmp) is used only when it exists and its real path is
-# outside that root; else /var/tmp.
-_t_base() {
-  local d=${TMPDIR:-/tmp} r low root
-  r=$(cd "$d" 2>/dev/null && pwd -P) || r=
-  low=$(printf '%s/' "$r" | tr '[:upper:]' '[:lower:]')
-  root=/tmp/claude-$(id -u)/
-  case "$low" in
-    /|"$root"*|/private"$root"*) echo /var/tmp ;;
-    *) echo "$r" ;;
-  esac
-}
+_t_base() { ca_temp_base; }   # R48: see common.sh
 
 t_setup() {
   T=$(mktemp -d "$(_t_base)/capart.XXXXXX") || return 1

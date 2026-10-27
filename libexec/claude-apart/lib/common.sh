@@ -76,3 +76,19 @@ install_links() {
     ln -sfn "$w" "$bin/$n" || return 1
   done
 }
+
+# R48: the temp base for scratch folders (tests, `check`). The adopted profile
+# owns /tmp/claude-<uid> (Claude Code's temp root, so $TMPDIR inside a
+# session), and a scratch HOME under it would be a foreign path for every
+# other profile. $TMPDIR (default /tmp) is used only when it exists and its
+# real path is outside that root; else /var/tmp.
+ca_temp_base() {
+  local d=${TMPDIR:-/tmp} r low root
+  r=$(cd "$d" 2>/dev/null && pwd -P) || r=
+  low=$(printf '%s/' "$r" | tr '[:upper:]' '[:lower:]')
+  root=/tmp/claude-$(id -u)/
+  case "$low" in
+    /|"$root"*|/private"$root"*) echo /var/tmp ;;
+    *) echo "$r" ;;
+  esac
+}

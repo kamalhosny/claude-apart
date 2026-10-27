@@ -81,6 +81,19 @@ sub tab_label {
     return $l;
 }
 
+# Opens a workspace: returns its id, or undef when herdr fails or its reply
+# has no id. The reply shape is the one `workspace get` uses.
+sub workspace_create {
+    my ($label, $cwd) = @_;
+    return undef unless defined $label && length $label && defined $cwd && length $cwd;
+    my $out = ClaudeApart::Proc::capture({ timeout => 10, max => $MAX_OUT }, "herdr",
+        "workspace", "create", "--label", $label, "--cwd", $cwd, "--focus");
+    my $d = defined $out ? eval { JSON::PP->new->utf8->decode($out) } : undef;
+    return undef unless ref $d eq "HASH";
+    my $id = eval { $d->{result}{workspace}{workspace_id} };
+    return (defined $id && $id =~ /\A$WS\z/) ? $id : undef;
+}
+
 # Rename a workspace or a tab. True when herdr accepted it; callers ignore
 # failure. Never cached (unlike the lookups).
 sub rename_workspace {

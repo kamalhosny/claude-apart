@@ -22,6 +22,8 @@ esac
 
 case "${1:-}" in
   sync) . "$CA_ROOT/libexec/claude-apart/cmd/sync.sh"; ca_sync; exit $? ;;
+  check) . "$CA_ROOT/libexec/claude-apart/cmd/check.sh"; shift; ca_check "$@"; exit $? ;;
+  new) . "$CA_ROOT/libexec/claude-apart/cmd/new.sh"; shift; ca_new "$@"; exit $? ;;
 esac
 
 case "${1:-}" in

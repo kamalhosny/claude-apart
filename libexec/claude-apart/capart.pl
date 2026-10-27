@@ -204,6 +204,40 @@ sub cmd_settings {
     return 0;
 }
 
+# new <name> [label] [--cwd DIR]: opens a Herdr workspace labelled for a profile
+# and prints its id. rc 1 on any refusal or herdr failure.
+sub cmd_new {
+    my (@a) = @_;
+    my (@pos, $cwd);
+    while (@a) {
+        my $f = shift @a;
+        if ($f eq "--cwd" && @a) { $cwd = shift @a } elsif ($f !~ /^-/) { push @pos, $f } else { return usage() }
+    }
+    return usage() unless @pos == 1 || @pos == 2;
+    my ($name, $label) = @pos;
+    my $cfg = ClaudeApart::Config::load(ClaudeApart::Config::config_path());
+    my $p = ClaudeApart::Config::profile($cfg, $name) or die "unknown profile: $name\n";
+    # R59: inside a session only the session's own profile.
+    if (($ENV{CLAUDE_CODE_CHILD_SESSION} || "") eq "1") {
+        my $own = session_profile($cfg);
+        unless (defined $own && $own eq $name) {
+            print STDERR "claude-apart: inside Claude you can only open a workspace for this session's own profile.\n";
+            return 1;
+        }
+    }
+    my $have = (($ENV{HERDR_ENV} || "") eq "1") ? 1 : 0;
+    for my $d (split /:/, ($ENV{PATH} || "")) { $have = 1 if length $d && -f "$d/herdr" && -x _ }
+    unless ($have) { print STDERR "claude-apart: Herdr is not available (not inside Herdr, and no herdr on PATH).\n"; return 1 }
+    require Cwd;
+    my $dir = defined $cwd ? Cwd::abs_path($cwd) : Cwd::getcwd();
+    die "not a folder: $cwd\n" unless defined $dir && -d $dir;
+    my $title = "$p->{emoji} $p->{tag} \xc2\xb7 " . (defined $label && length $label ? $label : $name);
+    my $id = ClaudeApart::Herdr::workspace_create($title, $dir);
+    unless (defined $id) { print STDERR "claude-apart: Herdr could not open the workspace.\n"; return 1 }
+    print "$id\n";
+    return 0;
+}
+
 my $cmd = shift @ARGV;
 unless (defined $cmd) { exit usage() }
 if ($cmd eq 'hook') {
@@ -225,6 +259,19 @@ if ($cmd eq "resolve" || $cmd eq "identity-check") {
 }
 if ($cmd eq "settings") {
     $rc = eval { cmd_settings(@ARGV) };
+    if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
+    exit $rc;
+}
+if ($cmd eq "new" || $cmd eq "check") {
+    $rc = eval {
+        if ($cmd eq "new") { cmd_new(@ARGV) }
+        else {
+            my $base;
+            if (@ARGV == 2 && $ARGV[0] eq "--tmp-base") { $base = $ARGV[1] } elsif (@ARGV) { return usage() }
+            require ClaudeApart::Check;
+            ClaudeApart::Check::run($base);
+        }
+    };
     if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
     exit $rc;
 }
