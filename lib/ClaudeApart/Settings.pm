@@ -39,32 +39,54 @@ sub _perl {
     return '/usr/bin/perl';
 }
 
+# Hint for a state file we cannot read.
+sub _state_hint { my $f = shift; return "delete $f and run again (claude-apart then finds its own entries by their command)" }
+
 sub _read_json {
-    my ($file, $what) = @_;
+    my ($file, $what, $hint) = @_;
     open my $fh, '<', $file or die "cannot read $file: $!\n";
     local $/;
     my $raw = <$fh>;
     close $fh;
     my $d = eval { _json()->decode($raw) };
-    die "$what is not valid JSON ($file); not touching it\n" unless defined $d;
-    die "$what is not a JSON object ($file); not touching it\n" unless ref $d eq 'HASH';
+    die "$what is not valid JSON ($file); not touching it" . ($hint ? "; $hint" : '') . "\n" unless defined $d;
+    die "$what is not a JSON object ($file); not touching it" . ($hint ? "; $hint" : '') . "\n" unless ref $d eq 'HASH';
     return $d;
 }
 
-sub _write_json {
-    my ($file, $d) = @_;
-    my $target = -l $file ? abs_path($file) : $file;
-    $target = $file unless defined $target;
-    my $tmp = "$target.tmp.$$";
+# tmp file + rename. $mode (if given) is set on the tmp file before any data
+# goes in; without it the new file gets the default mode.
+sub _write_atomic {
+    my ($file, $bytes, $mode) = @_;
+    my $tmp = "$file.tmp.$$";
     open my $fh, '>', $tmp or die "cannot write $tmp: $!\n";
-    print $fh _json()->encode($d) or do { unlink $tmp; die "write failed: $!\n" };
+    if (defined $mode) { chmod $mode, $tmp or do { unlink $tmp; die "cannot chmod $tmp: $!\n" } }
+    print $fh $bytes or do { unlink $tmp; die "write failed: $!\n" };
     close $fh or do { unlink $tmp; die "write failed: $!\n" };
-    rename $tmp, $target or do { my $e = $!; unlink $tmp; die "cannot rename to $target: $e\n" };
+    rename $tmp, $file or do { my $e = $!; unlink $tmp; die "cannot rename to $file: $e\n" };
+}
+
+# Settings keep their mode; state and backup files are private (0600).
+sub _write_json {
+    my ($file, $d, $private) = @_;
+    my $mode = $private ? 0600 : (-e $file ? ((stat $file)[2] & 07777) : undef);
+    _write_atomic($file, _json()->encode($d), $mode);
+}
+
+# Never follow a symlink out of the profile: the path must not be a link and
+# must resolve under the profile's own (canonical) folder.
+sub _guard_path {
+    my ($path, $dir) = @_;
+    my $cd = ClaudeApart::Paths::canon($dir);
+    my $cp = ClaudeApart::Paths::canon($path);
+    return unless -l $path || index($cp, "$cd/") != 0;
+    die "$path is a symlink or points outside this profile's folder; replace it with a regular file. Nothing was changed.\n";
 }
 
 # Deny rules for one root: bare form and /** form (file roots: bare only).
 # A ".*" family gets the bare file and a "<path>.*" glob. Roots whose real path
-# differs from the literal one are covered under both spellings.
+# differs from the literal one are covered under both spellings. An existing
+# path decides file or directory; the name (.json) only when it does not exist.
 sub _rules {
     my ($tool, @roots) = @_;
     my (@out, %seen);
@@ -75,7 +97,10 @@ sub _rules {
         for my $p (sort keys %sp) {
             $add->("$tool(/$p)");
             if ($fam) { $add->("$tool(/$p.*)") }
-            elsif (!(-f $p || $p =~ /\.json\z/)) { $add->("$tool(/$p/**)") }
+            else {
+                my $file = -d $p ? 0 : -e $p ? 1 : $p =~ /\.json\z/;
+                $add->("$tool(/$p/**)") unless $file;
+            }
         }
     }
     return @out;
@@ -85,29 +110,59 @@ sub _paths {
     my ($cfg, $name) = @_;
     my $p = ClaudeApart::Config::profile($cfg, $name) or die "unknown profile: $name\n";
     my $dir = $p->{abs_dir};
-    return ($p, "$dir/settings.json", "$dir/$STATE");
+    my ($file, $sfile) = ("$dir/settings.json", "$dir/$STATE");
+    _guard_path($_, $dir) for $file, $sfile, "$file$BAK";
+    return ($p, $file, $sfile);
 }
 
-sub _is_ours { my $c = shift; return defined $c && !ref $c && $c =~ /capart\.pl' statusline /; }
+# Our entries are recognised by their command shape, whatever path or perl.
+sub _hook_re {
+    my $n = _shq(shift);
+    return qr/capart\.pl' hook (?:pre-tool|prompt|session-start) --profile \Q$n\E(?: \|\| exit 2)?\z/;
+}
+
+# (1, chain) when the status line is ours, else (0).
+sub _status_shape {
+    my ($sl, $name) = @_;
+    return (0) unless ref $sl eq 'HASH' && defined $sl->{command} && !ref $sl->{command};
+    my $n = _shq($name);
+    return (0) unless $sl->{command} =~ /capart\.pl' statusline --profile \Q$n\E(?: --chain '((?:[^']|'\\'')*)')?\z/;
+    my $c = $1;
+    $c =~ s/'\\''/'/g if defined $c;
+    return (1, $c);
+}
+
+sub _check_types {
+    my ($d, $file) = @_;
+    my $bad = sub { die "settings.json: $_[0] has the wrong type ($file); not touching it\n" };
+    $bad->('permissions') if exists $d->{permissions} && ref $d->{permissions} ne 'HASH';
+    $bad->('permissions.deny') if ref $d->{permissions} eq 'HASH' && exists $d->{permissions}{deny} && ref $d->{permissions}{deny} ne 'ARRAY';
+    $bad->('hooks') if exists $d->{hooks} && ref $d->{hooks} ne 'HASH';
+    if (ref $d->{hooks} eq 'HASH') {
+        for my $ev (sort keys %{ $d->{hooks} }) { $bad->("hooks.$ev") if ref $d->{hooks}{$ev} ne 'ARRAY' }
+    }
+}
+
+sub _read_state {
+    my ($sfile) = @_;
+    my $st = _read_json($sfile, 'claude-apart state file', _state_hint($sfile));
+    for my $k (qw(deny created)) {
+        die "claude-apart state file has the wrong type ($sfile); " . _state_hint($sfile) . "\n"
+            if exists $st->{$k} && ref $st->{$k} ne ($k eq 'deny' ? 'ARRAY' : 'HASH');
+    }
+    return $st;
+}
 
 sub install {
     my ($cfg, $name) = @_;
     my ($p, $file, $sfile) = _paths($cfg, $name);
     my $dir = $p->{abs_dir};
-    # Read everything first: a bad file stops us before any change.
+    # Read and check everything first: a bad file stops us before any change.
     my $have = -e $file;
     my $d = $have ? _read_json($file, 'settings.json') : {};
-    my $st = -e $sfile ? _read_json($sfile, 'claude-apart state file') : undef;
-    _undo($d, $st) if $st;
-    for my $k (qw(permissions hooks)) {
-        die "settings.json: '$k' is not an object ($file); not touching it\n" if exists $d->{$k} && ref $d->{$k} ne 'HASH';
-    }
-    die "settings.json: permissions.deny is not a list ($file); not touching it\n"
-        if $d->{permissions} && exists $d->{permissions}{deny} && ref $d->{permissions}{deny} ne 'ARRAY';
-    for my $e (@EVENTS) {
-        die "settings.json: hooks.$e->[0] is not a list ($file); not touching it\n"
-            if $d->{hooks} && exists $d->{hooks}{ $e->[0] } && ref $d->{hooks}{ $e->[0] } ne 'ARRAY';
-    }
+    my $st = -e $sfile ? _read_state($sfile) : undef;
+    _check_types($d, $file);
+    _undo($d, $st, $name);
 
     my %new = (version => 1, deny => [], hooks => {}, created => {});
     # Deny rules: read-type on the unreadable roots, edit-type on every foreign root.
@@ -126,19 +181,18 @@ sub install {
     # Hooks, one entry per event.
     my ($root, $perl) = (_root(), _perl());
     my $base = join ' ', _shq($perl), _shq("-I$root/lib"), _shq("$root/libexec/claude-apart/capart.pl");
-    $new{created}{hooks} = 1 unless exists $d->{hooks};
     for my $e (@EVENTS) {
         my ($ev, $sub, $closed) = @$e;
         my $cmd = "$base hook $sub --profile " . _shq($name) . ($closed ? ' || exit 2' : '');
-        $new{created}{events}{$ev} = 1 unless exists $d->{hooks}{$ev};
         push @{ $d->{hooks}{$ev} }, { matcher => '*', hooks => [ { type => 'command', command => $cmd, timeout => 10 } ] };
         $new{hooks}{$ev} = $cmd;
     }
 
-    # Status line: keep the user's own one behind --chain.
+    # Status line: keep the user's own one behind --chain. _undo already put
+    # back the original, so anything still ours here is from another profile.
     my $orig = $d->{statusLine};
     my $cmd = "$base statusline --profile " . _shq($name);
-    my $ours = ref $orig eq 'HASH' && _is_ours($orig->{command});
+    my $ours = ref $orig eq 'HASH' && defined $orig->{command} && !ref $orig->{command} && $orig->{command} =~ /capart\.pl' statusline /;
     $cmd .= ' --chain ' . _shq($orig->{command})
         if ref $orig eq 'HASH' && !$ours && defined $orig->{command} && !ref $orig->{command} && length $orig->{command};
     $new{statusLine_original} = $ours ? undef : $orig;
@@ -152,50 +206,65 @@ sub install {
         $d->{theme} = $p->{theme};
     }
 
-    # Changes start here: backup once, settings, then the state file.
+    # Changes start here: backup once, then the state file, then settings (a
+    # state that lists too much undoes nothing; too little would leave residue).
+    -d $dir or do { require File::Path; File::Path::make_path($dir); -d $dir or die "cannot create $dir: $!\n" };
     if ($have && !-e "$file$BAK") {
         open my $in, '<', $file or die "cannot read $file: $!\n";
         binmode $in; local $/;
         my $raw = <$in>; close $in;
-        my $tmp = "$file$BAK.tmp.$$";
-        open my $out, '>', $tmp or die "cannot write $tmp: $!\n";
-        binmode $out;
-        print $out $raw; close $out or die "write failed: $!\n";
-        rename $tmp, "$file$BAK" or do { my $e = $!; unlink $tmp; die "cannot write backup: $e\n" };
+        _write_atomic("$file$BAK", $raw, 0600);
     }
-    -d $dir or do { require File::Path; File::Path::make_path($dir); -d $dir or die "cannot create $dir: $!\n" };
+    _write_json($sfile, \%new, 1);
     _write_json($file, $d);
-    _write_json($sfile, \%new);
     return 1;
 }
 
-# Takes out what the state file lists; $d is changed in place.
+# Takes out what we added; $d is changed in place. Hooks and the status line
+# are recognised by command shape (so a lost or stale state file still works);
+# deny rules and the theme come from the state file only.
 sub _undo {
-    my ($d, $st) = @_;
-    my $deny = $d->{permissions} && ref $d->{permissions}{deny} eq 'ARRAY' ? $d->{permissions}{deny} : undef;
-    if ($deny) {
+    my ($d, $st, $name) = @_;
+    my $deny = ref $d->{permissions} eq 'HASH' && ref $d->{permissions}{deny} eq 'ARRAY' ? $d->{permissions}{deny} : undef;
+    if ($deny && $st) {
         my %gone = map { $_ => 1 } @{ $st->{deny} || [] };
         @$deny = grep { ref $_ || !$gone{$_} } @$deny;
-        delete $d->{permissions}{deny} if !@$deny && $st->{created}{deny};
-        delete $d->{permissions} if ref $d->{permissions} eq 'HASH' && !%{ $d->{permissions} } && $st->{created}{permissions};
+        my $c = $st->{created} || {};
+        delete $d->{permissions}{deny} if !@$deny && $c->{deny};
+        delete $d->{permissions} if !%{ $d->{permissions} } && $c->{permissions};
     }
-    for my $ev (keys %{ $st->{hooks} || {} }) {
-        my $list = $d->{hooks} && ref $d->{hooks}{$ev} eq 'ARRAY' ? $d->{hooks}{$ev} : next;
-        my $cmd = $st->{hooks}{$ev};
-        @$list = grep {
-            my $g = $_;
-            !(ref $g eq 'HASH' && ref $g->{hooks} eq 'ARRAY' && @{ $g->{hooks} } == 1
-              && ref $g->{hooks}[0] eq 'HASH' && defined $g->{hooks}[0]{command} && $g->{hooks}[0]{command} eq $cmd)
-        } @$list;
-        delete $d->{hooks}{$ev} if !@$list && $st->{created}{events}{$ev};
+    if (ref $d->{hooks} eq 'HASH') {
+        my $re = _hook_re($name);
+        my $removed = 0;
+        for my $ev (keys %{ $d->{hooks} }) {
+            my $list = $d->{hooks}{$ev};
+            next unless ref $list eq 'ARRAY';
+            my ($touched, @keep) = (0);
+            for my $g (@$list) {
+                if (ref $g eq 'HASH' && ref $g->{hooks} eq 'ARRAY') {
+                    my @h = grep { !(ref $_ eq 'HASH' && defined $_->{command} && !ref $_->{command} && $_->{command} =~ $re) } @{ $g->{hooks} };
+                    if (@h != @{ $g->{hooks} }) {
+                        $touched = 1;
+                        next unless @h;
+                        $g->{hooks} = \@h;
+                    }
+                }
+                push @keep, $g;
+            }
+            next unless $touched;
+            $removed = 1;
+            @$list = @keep;
+            delete $d->{hooks}{$ev} unless @$list;
+        }
+        delete $d->{hooks} if $removed && !%{ $d->{hooks} };
     }
-    delete $d->{hooks} if ref $d->{hooks} eq 'HASH' && !%{ $d->{hooks} } && $st->{created}{hooks};
-    # Status line and theme go back only if they are still the values we wrote.
-    my $set = $st->{statusLine_set};
-    if ($set && ref $d->{statusLine} eq 'HASH' && defined $d->{statusLine}{command} && $d->{statusLine}{command} eq $set->{command}) {
-        if (defined $st->{statusLine_original}) { $d->{statusLine} = $st->{statusLine_original} } else { delete $d->{statusLine} }
+    my ($ours, $chain) = _status_shape($d->{statusLine}, $name);
+    if ($ours) {
+        my $orig = $st ? $st->{statusLine_original}
+                 : defined $chain ? { type => 'command', command => $chain } : undef;
+        if (defined $orig) { $d->{statusLine} = $orig } else { delete $d->{statusLine} }
     }
-    if (exists $st->{theme_set} && defined $d->{theme} && $d->{theme} eq $st->{theme_set}) {
+    if ($st && exists $st->{theme_set} && defined $d->{theme} && $d->{theme} eq $st->{theme_set}) {
         if (exists $st->{theme_original}) { $d->{theme} = $st->{theme_original} } else { delete $d->{theme} }
     }
 }
@@ -203,14 +272,19 @@ sub _undo {
 sub uninstall {
     my ($cfg, $name) = @_;
     my ($p, $file, $sfile) = _paths($cfg, $name);
-    return 1 unless -e $sfile;
-    my $st = _read_json($sfile, 'claude-apart state file');
+    my $st = -e $sfile ? _read_state($sfile) : undef;
     if (-e $file) {
-        my $d = _read_json($file, 'settings.json');
-        _undo($d, $st);
-        _write_json($file, $d);
+        # With no state file, only a settings file that parses is cleaned
+        # (by command shape); anything else is left alone.
+        my $d = $st ? _read_json($file, 'settings.json') : eval { _read_json($file, 'settings.json') };
+        if ($d) {
+            _check_types($d, $file);
+            my $before = _json()->encode($d);
+            _undo($d, $st, $name);
+            _write_json($file, $d) if _json()->encode($d) ne $before;
+        }
     }
-    unlink $sfile or die "cannot remove $sfile: $!\n";
+    if ($st) { unlink $sfile or die "cannot remove $sfile: $!\n" }
     return 1;
 }
 
