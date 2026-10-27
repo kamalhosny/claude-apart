@@ -56,11 +56,13 @@ sub _read_json {
 }
 
 # tmp file + rename. $mode (if given) is set on the tmp file before any data
-# goes in; without it the new file gets the default mode.
+# goes in; without it the new file is private (0600).
 sub _write_atomic {
     my ($file, $bytes, $mode) = @_;
     my $tmp = "$file.tmp.$$";
-    # O_EXCL: never write into a file or link that is already there
+    # a stale link of that name is removed (unlink does not follow it); O_EXCL still
+    # refuses anything that appears in between
+    unlink $tmp if -l $tmp;
     sysopen(my $fh, $tmp, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_EXCL(), 0600) or die "cannot write $tmp: $!\n";
     if (defined $mode) { chmod $mode, $tmp or do { unlink $tmp; die "cannot chmod $tmp: $!\n" } }
     print $fh $bytes or do { unlink $tmp; die "write failed: $!\n" };
@@ -134,6 +136,13 @@ sub _status_shape {
     return (1, $c);
 }
 
+# The status line command of the badge, with the chained command if any.
+sub badge_command {
+    my ($name, $chain) = @_;
+    my $base = join ' ', _shq(_perl()), _shq("-I" . _root() . "/lib"), _shq(_root() . "/libexec/claude-apart/capart.pl");
+    return "$base statusline --profile " . _shq($name) . (defined $chain && length $chain ? ' --chain ' . _shq($chain) : '');
+}
+
 sub _check_types {
     my ($d, $file) = @_;
     my $bad = sub { die "settings.json: $_[0] has the wrong type ($file); not touching it\n" };
@@ -193,10 +202,8 @@ sub install {
     # Status line: keep the user's own one behind --chain. _undo already put
     # back the original, so anything still ours here is from another profile.
     my $orig = $d->{statusLine};
-    my $cmd = "$base statusline --profile " . _shq($name);
     my $ours = ref $orig eq 'HASH' && defined $orig->{command} && !ref $orig->{command} && $orig->{command} =~ /capart\.pl' statusline /;
-    $cmd .= ' --chain ' . _shq($orig->{command})
-        if ref $orig eq 'HASH' && !$ours && defined $orig->{command} && !ref $orig->{command} && length $orig->{command};
+    my $cmd = badge_command($name, ref $orig eq 'HASH' && !$ours && defined $orig->{command} && !ref $orig->{command} && length $orig->{command} ? $orig->{command} : undef);
     $new{statusLine_original} = $ours ? undef : $orig;
     $new{statusLine_set} = { type => 'command', command => $cmd };
     $d->{statusLine} = $new{statusLine_set};

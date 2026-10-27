@@ -19,6 +19,11 @@ ca_copy() {
   exec 3<"$tty"
   while IFS=$'\t' read -r kind id label prev; do
     [ -n "$kind" ] || continue
+    if [ "$kind" = skip ]; then
+      skipped=$((skipped + 1))
+      printf '\nSkipped: %s\n    %s\n' "$label" "$(printf '%b' "$prev")"
+      continue
+    fi
     if [ "$eof" = 1 ]; then skipped=$((skipped + 1)); continue; fi
     printf '\n[%s] %s\n' "$kind" "$label"
     printf '%b\n' "$prev" | sed 's/^/    | /'

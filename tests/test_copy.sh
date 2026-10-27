@@ -253,12 +253,8 @@ test_statusline_chained_when_target_has_badge() {
   _copy_fixture
   printf '{"statusLine":{"type":"command","command":"~/.claude/hooks/h.sh"}}\n' > "$HOME/.claude/settings.json"
   run claude-apart sync
-  # personal has our badge now; use a fresh source: write source statusLine by hand after sync
-  perl -MJSON::PP -e '
-    my $f = shift; local $/; open my $h, "<", $f or die; my $d = decode_json(<$h>); close $h;
-    $d->{statusLine} = {type=>"command", command=>"~/.claude/hooks/h.sh"};
-    open $h, ">", $f or die; print $h encode_json($d); close $h' "$HOME/.claude/settings.json"
-  # source line is not ours now (replaced), so it is listed
+  assert_rc 0 "sync" || return 1
+  # the source now has our badge; the item offered is its original line
   run capart_pl copy-items personal work
   assert_contains "$OUT" "statusline" "listed" || return 1
   _apply personal work statusline statusLine
@@ -269,6 +265,9 @@ test_statusline_chained_when_target_has_badge() {
   run claude-apart sync
   assert_rc 0 "resync" || return 1
   assert_contains "$(cat "$HOME/.claude-work/settings.json")" "--chain '~/.claude-work/hooks/h.sh'" "still chained after sync" || return 1
+  run claude-apart check
+  assert_rc 0 "check after chain" || return 1
+  assert_not_contains "$OUT" "✗" "no failure" || return 1
 }
 
 test_statusline_set_when_target_has_none() {
@@ -305,9 +304,16 @@ test_theme_not_offered_when_target_theme_is_managed() {
 
 test_copy_report_counts() {
   _copy_fixture
-  _copy_run "n\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\n"
-  assert_contains "$OUT" "Copied 0" "copied count" || return 1
-  assert_contains "$OUT" "skipped" "skipped count" || return 1
+  local n; n=$(capart_pl copy-items personal work | wc -l | tr -d " ")
+  _copy_run "n\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\n"
+  assert_contains "$OUT" "Copied 0, skipped $n." "counts" || return 1
+}
+
+test_answers_run_out_midway() {
+  _copy_fixture
+  local n; n=$(capart_pl copy-items personal work | wc -l | tr -d " ")
+  _copy_run "y\n"
+  assert_contains "$OUT" "Copied 1, skipped $((n - 1))." "rest count as no" || return 1
 }
 
 test_unknown_profile_and_same_profile() {
@@ -316,4 +322,73 @@ test_unknown_profile_and_same_profile() {
   assert_rc 1 "unknown" || return 1
   run capart_pl copy-items personal personal
   assert_rc 1 "same" || return 1
+}
+
+# ---- fix round 1 ----
+
+_hook_settings() { # <command>: the source settings have one Stop hook
+  perl -MJSON::PP -e 'print encode_json({hooks=>{Stop=>[{hooks=>[{type=>"command",command=>shift}]}]}})' "$1" > "$HOME/.claude/settings.json"
+}
+
+test_hook_naming_settings_json_is_skipped() {
+  _copy_fixture
+  echo '{"mine":1}' > "$HOME/.claude-work/settings.json"
+  _hook_settings '~/.claude/hooks/h.sh ~/.claude/settings.json'
+  run capart_pl copy-items personal work
+  assert_not_contains "$OUT" $'hook\tStop#0' "not offered" || return 1
+  assert_contains "$OUT" "names settings.json inside personal, which cannot be copied" "reason" || return 1
+  _apply personal work hook Stop#0
+  [ "$RC" != 0 ] || { echo "applied"; return 1; }
+  assert_eq '{"mine":1}' "$(cat "$HOME/.claude-work/settings.json")" "settings untouched" || return 1
+}
+
+test_hook_naming_private_note_is_skipped() {
+  _copy_fixture
+  _hook_settings 'cat ~/.claude/projects/-x/memory/b.md'
+  run capart_pl copy-items personal work
+  assert_contains "$OUT" "names projects/-x/memory/b.md inside personal" "reason" || return 1
+  _apply personal work hook Stop#0
+  [ "$RC" != 0 ] || return 1
+  [ ! -e "$HOME/.claude-work/projects" ] || { echo "carried"; return 1; }
+}
+
+test_hook_carried_file_is_shown() {
+  _copy_fixture
+  _hook_settings '~/.claude/hooks/h.sh'
+  mkdir -p "$HOME/.claude-work/hooks"; echo old > "$HOME/.claude-work/hooks/h.sh"
+  run capart_pl copy-items personal work
+  assert_contains "$OUT" "carries hooks/h.sh" "carry line" || return 1
+  assert_contains "$OUT" "(replaces what work already has)" "replace note" || return 1
+  _apply personal work hook Stop#0
+  assert_rc 0 "apply" || return 1
+  assert_eq "echo hi" "$(cat "$HOME/.claude-work/hooks/h.sh")" "carried" || return 1
+}
+
+test_linked_source_folders_not_followed() {
+  _copy_fixture
+  mkdir -p "$T/out/skills/evil" "$T/out/hooks"
+  echo e > "$T/out/skills/evil/SKILL.md"; echo 'echo out' > "$T/out/hooks/h.sh"
+  rm -rf "$HOME/.claude/skills" "$HOME/.claude/hooks"
+  ln -s "$T/out/skills" "$HOME/.claude/skills"; ln -s "$T/out/hooks" "$HOME/.claude/hooks"
+  run capart_pl copy-items personal work
+  assert_not_contains "$OUT" "skills/evil" "linked skills dir" || return 1
+  _hook_settings '~/.claude/hooks/h.sh'
+  _apply personal work hook Stop#0
+  [ ! -e "$HOME/.claude-work/hooks/h.sh" ] || { echo "carried through link"; return 1; }
+}
+
+test_theme_managed_in_source_not_offered() {
+  _copy_fixture
+  printf '{"theme":"x"}\n' > "$HOME/.claude/settings.json"
+  perl -pi -e 's/^(\[profile personal\])$/$1\ntheme = dark/' "$XDG_CONFIG_HOME/claude-apart/config"
+  run claude-apart sync
+  run capart_pl copy-items personal work
+  assert_not_contains "$OUT" "theme" "source theme is managed" || return 1
+}
+
+test_utf8_names_printed_as_utf8() {
+  _copy_fixture
+  printf '{"enabledPlugins":{"café@m":true}}\n' > "$HOME/.claude/settings.json"
+  run capart_pl copy-items personal work
+  assert_contains "$OUT" "café@m" "utf8 name" || return 1
 }

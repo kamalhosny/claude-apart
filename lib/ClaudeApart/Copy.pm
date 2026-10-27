@@ -22,7 +22,13 @@ use ClaudeApart::Settings;
 my $PREVIEW_LINES = 8;
 my @DIR_KINDS = (['skill', 'skills'], ['agent', 'agents'], ['command', 'commands'], ['output-style', 'output-styles']);
 my %NEVER_NAME = map { $_ => 1 } ('.claude-apart-state.json', 'settings.json.claude-apart.bak', '.claude.json', '.credentials.json');
-my $OURS_RE = qr/capart\.pl' (?:hook (?:pre-tool|prompt|session-start)|statusline) --profile /;
+# Top-level folders of a profile that a hook or status line may never carry
+# along: private data (memory, sessions, history, caches, logs), things Claude
+# Code manages itself (plugins, todos, backups, ...) and the item folders that
+# have their own copy kind.
+my %NOCARRY = map { $_ => 1 } qw(projects sessions file-history shell-snapshots todos statsig backups plugins ide
+    skills agents commands output-styles plans debug logs cache telemetry session-env paste-cache downloads local shell);
+my @NAMES;    # every configured profile name, for recognising claude-apart's own entries
 
 sub _never_name {
     my ($n) = @_;
@@ -41,12 +47,15 @@ sub _check_rel {
 
 sub _inside { my ($path, $canon_root) = @_; return index(ClaudeApart::Paths::canon($path), "$canon_root/") == 0 }
 
-# Source readability: a plain entry, or a link that resolves inside the source folder.
+# Source readability: the entry exists and, with every symlink on the way
+# resolved, lies inside the source folder.
 sub _src_ok {
     my ($path, $sroot) = @_;
-    return 1 unless -l $path;
     return -e $path && _inside($path, $sroot) ? 1 : 0;
 }
+
+# JSON text is characters; the terminal output is UTF-8 bytes.
+sub _b { my ($s) = @_; utf8::encode($s); return $s }
 
 # Walks the target path component by component; any symlink stops it. With $mk
 # the missing parent folders are made (one at a time, so each is checked).
@@ -147,8 +156,62 @@ sub _state_listed {
 sub _is_ours {
     my ($cmd, @listed) = @_;
     return 0 unless defined $cmd && !ref $cmd;
-    return 1 if $cmd =~ $OURS_RE;
+    for my $n (@NAMES) {
+        return 1 if $cmd =~ ClaudeApart::Settings::_hook_re($n);
+        return 1 if (ClaudeApart::Settings::_status_shape({ command => $cmd }, $n))[0];
+    }
     return (grep { $_->{$cmd} } @listed) ? 1 : 0;
+}
+
+# The status line a source can hand over. A claude-apart badge is not it; the
+# line it chains (the user's own) is, if there is one.
+sub _src_statusline {
+    my ($s, $fp, $from, @listed) = @_;
+    my $sl = $s->{statusLine};
+    return undef unless ref $sl eq 'HASH' && defined $sl->{command} && !ref $sl->{command} && length $sl->{command};
+    my ($badge, $chain) = ClaudeApart::Settings::_status_shape($sl, $from);
+    return $sl unless $badge || _is_ours($sl->{command}, @listed);
+    my $st = _read_state_quiet($fp->{abs_dir});
+    my $o = $st ? $st->{statusLine_original} : (defined $chain && length $chain ? { type => 'command', command => $chain } : undef);
+    return (ref $o eq 'HASH' && defined $o->{command} && !ref $o->{command} && length $o->{command} && !_is_ours($o->{command}, @listed)) ? $o : undef;
+}
+
+# What a command needs from the source folder. Returns the command for the
+# target, the files to carry (relative) and the first path that may not be carried.
+sub _plan {
+    my ($cmd, $fp, $tp, $sroot) = @_;
+    my ($new, @files) = _rewrite($cmd, $fp->{abs_dir}, $tp->{abs_dir});
+    my (%seen, @carry, $blocked);
+    for my $rel (grep { !$seen{$_}++ } @files) {
+        if (!eval { _check_rel($rel); 1 }) { $blocked = $rel unless defined $blocked; next }
+        my $src = "$sroot/$rel";
+        next unless -e $src || -l $src;    # nothing there, nothing to leak
+        if (_carriable($rel, $src, $sroot)) { push @carry, $rel } else { $blocked = $rel unless defined $blocked }
+    }
+    return ($new, \@carry, $blocked);
+}
+
+# R69: only a plain script-like file below a top-level folder that is not private.
+sub _carriable {
+    my ($rel, $src, $sroot) = @_;
+    my @p = split m{/}, $rel;
+    return 0 if @p < 2 || $NOCARRY{ $p[0] };
+    my $n = $p[-1];
+    return 0 if $n =~ /\Asettings.*\.json\z/ || $n =~ /\A\.claude.*\.json/ || $n eq 'CLAUDE.md'
+        || $n =~ /\.jsonl\z/ || $n =~ /\A\.?credentials/ || _never_name($n);
+    return -f $src && _src_ok($src, $sroot) ? 1 : 0;
+}
+
+# Preview lines for a command item: what it carries and what that replaces.
+sub _carry_lines {
+    my ($carry, $sroot, $tcan, $to) = @_;
+    my @l;
+    for my $rel (@$carry) {
+        my $t = "$tcan/$rel";
+        my $note = (-f $t && !-l $t && _slurp($t) ne _slurp("$sroot/$rel")) ? " (replaces what $to already has)" : '';
+        push @l, _clean(_b("carries $rel")) . $note;
+    }
+    return @l;
 }
 
 sub _src_settings {
@@ -208,6 +271,7 @@ sub _kind_file { my ($k) = @_; return $k eq 'claude-md' }
 
 sub items {
     my ($cfg, $from, $to) = @_;
+    @NAMES = ClaudeApart::Config::profile_names($cfg);
     my $fp = _profile($cfg, $from);
     my $tp = _profile($cfg, $to);
     die "choose two different profiles\n" if $from eq $to;
@@ -225,7 +289,7 @@ sub items {
     };
 
     # memory notes
-    if (opendir my $pd, "$sroot/projects") {
+    if (_src_ok("$sroot/projects", $sroot) && opendir my $pd, "$sroot/projects") {
         for my $proj (sort grep { !/\A\./ } readdir $pd) {
             my $mdir = "$sroot/projects/$proj/memory";
             next unless -d $mdir && _src_ok("$sroot/projects/$proj", $sroot) && _src_ok($mdir, $sroot);
@@ -244,6 +308,7 @@ sub items {
     # skills, agents, commands, output styles
     for my $dk (@DIR_KINDS) {
         my ($kind, $d) = @$dk;
+        next unless _src_ok("$sroot/$d", $sroot);
         opendir my $dh, "$sroot/$d" or next;
         for my $n (sort grep { !/\A\./ } readdir $dh) {
             my $p = "$sroot/$d/$n";
@@ -270,29 +335,45 @@ sub items {
             for my $g (@{ $s->{hooks}{$ev} }) {
                 $i++;
                 my @h = _own_free($g, @listed) or next;
-                my @prev = map { _clean(ref $_ eq 'HASH' && defined $_->{command} && !ref $_->{command} ? $_->{command} : JSON::PP->new->canonical->encode($_)) } @h;
-                splice @prev, $PREVIEW_LINES;
+                my (@prev, @carry, $blocked);
+                for my $e (@h) {
+                    my $cmd = ref $e eq 'HASH' && defined $e->{command} && !ref $e->{command} ? $e->{command} : undef;
+                    push @prev, _clean(_b(defined $cmd ? $cmd : JSON::PP->new->canonical->encode($e)));
+                    next unless defined $cmd;
+                    my (undef, $c, $b) = _plan($cmd, $fp, $tp, $sroot);
+                    push @carry, @$c;
+                    $blocked = $b if defined $b && !defined $blocked;
+                }
                 my $m = ref $g eq 'HASH' && defined $g->{matcher} && !ref $g->{matcher} ? " (matcher $g->{matcher})" : '';
-                $add->('hook', "$ev#$i", "$ev#$i$m", \@prev);
+                if (defined $blocked) { $add->('skip', "$ev#$i", "hook $ev#$i$m", [ _skip_reason($blocked, $from) ]); next }
+                my %u;
+                push @prev, _carry_lines([ grep { !$u{$_}++ } @carry ], $sroot, $tcan, $to);
+                splice @prev, $PREVIEW_LINES;
+                $add->('hook', "$ev#$i", _b("$ev#$i$m"), \@prev);
             }
         }
     }
-    my $sl = $s->{statusLine};
-    if (ref $sl eq 'HASH' && defined $sl->{command} && !ref $sl->{command} && length $sl->{command} && !_is_ours($sl->{command}, @listed)) {
-        $add->('statusline', 'statusLine', 'status line', [ _clean($sl->{command}) ]);
+    my $sl = _src_statusline($s, $fp, $from, @listed);
+    if ($sl) {
+        my (undef, $c, $b) = _plan($sl->{command}, $fp, $tp, $sroot);
+        if (defined $b) { $add->('skip', 'statusLine', 'status line', [ _skip_reason($b, $from) ]) }
+        else { $add->('statusline', 'statusLine', 'status line', [ _clean(_b($sl->{command})), _carry_lines($c, $sroot, $tcan, $to) ]) }
     }
     my $tst = _read_state_quiet($tp->{abs_dir});
+    my $sst = _read_state_quiet($fp->{abs_dir});
     for my $k (qw(model theme)) {
         next unless defined $s->{$k} && !ref $s->{$k} && length $s->{$k};
-        next if $k eq 'theme' && $tst && exists $tst->{theme_set};    # the profile's theme belongs to claude-apart
-        $add->('setting', $k, "$k = $s->{$k}", [ _clean("$k = $s->{$k}") ]);
+        # the theme of a profile claude-apart manages (either side) is not ours to move
+        next if $k eq 'theme' && (($tst && exists $tst->{theme_set}) || ($sst && exists $sst->{theme_set}));
+        $add->('setting', $k, _b("$k = $s->{$k}"), [ _clean(_b("$k = $s->{$k}")) ]);
     }
     if (ref $s->{enabledPlugins} eq 'HASH' && %{ $s->{enabledPlugins} }) {
-        my @p = map { _clean("$_ = " . JSON::PP->new->allow_nonref->encode($s->{enabledPlugins}{$_})) } sort keys %{ $s->{enabledPlugins} };
+        my @p = map { _clean(_b("$_ = " . JSON::PP->new->allow_nonref->encode($s->{enabledPlugins}{$_}))) } sort keys %{ $s->{enabledPlugins} };
         splice @p, $PREVIEW_LINES;
         $add->('setting', 'enabledPlugins', 'enabledPlugins', \@p);
     }
     return @out;
+
 }
 
 sub _read_state_quiet {
@@ -310,6 +391,8 @@ sub _listing {
     }
     return @l;
 }
+
+sub _skip_reason { my ($rel, $from) = @_; return _clean(_b("names $rel inside $from, which cannot be copied")) }
 
 # The hook entries of one group that are not claude-apart's.
 sub _own_free {
@@ -356,7 +439,7 @@ sub apply {
         if (-d "$sroot/$id") { _copy_tree($sroot, $tcan, $id, 0) } else { _copy_file($sroot, $tcan, $id) }
     }
     elsif ($kind eq 'hook') { _copy_hook($cfg, $fp, $tp, $sroot, $tcan, $to, $id) }
-    elsif ($kind eq 'statusline') { return _copy_statusline($cfg, $fp, $tp, $sroot, $tcan, $to) }
+    elsif ($kind eq 'statusline') { return _copy_statusline($cfg, $fp, $tp, $sroot, $tcan, $to, $from) }
     elsif ($kind eq 'setting') { _copy_setting($cfg, $fp, $to, $sroot, $id) }
     else { die "unknown kind\n" }
     return "copied $kind $id";
@@ -413,17 +496,12 @@ sub _copy_memory {
 }
 
 # Copies the files a command points at under the source folder; returns the
-# command rewritten for the target.
+# command rewritten for the target. Refuses if it names anything not carriable.
 sub _carry_files {
     my ($cmd, $fp, $tp, $sroot, $tcan) = @_;
-    my ($new, @files) = _rewrite($cmd, $fp->{abs_dir}, $tp->{abs_dir});
-    my %seen;
-    for my $rel (grep { !$seen{$_}++ } @files) {
-        next unless eval { _check_rel($rel); 1 };
-        my $src = "$sroot/$rel";
-        next unless -f $src && _src_ok($src, $sroot) && !_never_name((split m{/}, $rel)[-1]);
-        _copy_file($sroot, $tcan, $rel);
-    }
+    my ($new, $carry, $blocked) = _plan($cmd, $fp, $tp, $sroot);
+    die _skip_reason($blocked, $fp->{name}) . "\n" if defined $blocked;
+    _copy_file($sroot, $tcan, $_) for @$carry;
     return $new;
 }
 
@@ -453,22 +531,21 @@ sub _copy_hook {
 }
 
 sub _copy_statusline {
-    my ($cfg, $fp, $tp, $sroot, $tcan, $to) = @_;
-    my $sl = _src_settings($sroot)->{statusLine};
+    my ($cfg, $fp, $tp, $sroot, $tcan, $to, $from) = @_;
+    my @listed = (_state_listed($fp->{abs_dir}), _state_listed($tp->{abs_dir}));
+    my $sl = _src_statusline(_src_settings($sroot), $fp, $from, @listed) or die "no status line to copy\n";
     my $enc = JSON::PP->new->canonical;
     my $new = $enc->decode($enc->encode($sl));
     $new->{command} = _carry_files($new->{command}, $fp, $tp, $sroot, $tcan);
     my $result = "copied statusline";
     ClaudeApart::Settings::modify($cfg, $to, sub {
         my ($d, $st) = @_;
-        my $cur = $d->{statusLine};
-        my $ours = ref $cur eq 'HASH' && defined $cur->{command} && !ref $cur->{command}
-            && ($cur->{command} =~ /capart\.pl' statusline --profile / || _is_ours($cur->{command}, _state_listed($tp->{abs_dir})));
+        my ($ours) = ClaudeApart::Settings::_status_shape($d->{statusLine}, $to);
         if ($ours) {
-            # keep the badge; the copied command becomes the chained original
-            (my $base = $cur->{command}) =~ s/ --chain '(?:[^']|'\\'')*'\z//;
-            $cur->{command} = "$base --chain " . ClaudeApart::Settings::_shq($new->{command});
-            $st->{statusLine_original} = $new if $st;
+            # keep the target's badge; the copied command becomes the line it chains
+            my $badge = { type => 'command', command => ClaudeApart::Settings::badge_command($to, $new->{command}) };
+            $d->{statusLine} = $badge;
+            if ($st) { $st->{statusLine_original} = $new; $st->{statusLine_set} = { %$badge } }
             $result = "copied statusline (chained behind the claude-apart badge)";
         } else {
             $d->{statusLine} = $new;
