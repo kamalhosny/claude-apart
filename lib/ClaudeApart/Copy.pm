@@ -195,9 +195,10 @@ sub _plan {
 sub _carriable {
     my ($rel, $src, $sroot) = @_;
     my @p = split m{/}, $rel;
-    return 0 if @p < 2 || $NOCARRY{ $p[0] };
-    my $n = $p[-1];
-    return 0 if $n =~ /\Asettings.*\.json\z/ || $n =~ /\A\.claude.*\.json/ || $n eq 'CLAUDE.md'
+    # R70: any letter case, on every OS (the disk may ignore case)
+    return 0 if @p < 2 || $NOCARRY{ lc $p[0] };
+    my $n = lc $p[-1];
+    return 0 if $n =~ /\Asettings.*\.json\z/ || $n =~ /\A\.claude.*\.json/ || $n eq 'claude.md'
         || $n =~ /\.jsonl\z/ || $n =~ /\A\.?credentials/ || _never_name($n);
     return -f $src && _src_ok($src, $sroot) ? 1 : 0;
 }
@@ -255,12 +256,16 @@ sub _rewrite {
     if (defined $trel && defined $srel) { %to = (%to, "~/$srel" => "~/$trel", "\$HOME/$srel" => "\$HOME/$trel", "\${HOME}/$srel" => "\${HOME}/$trel") }
     my @alt = sort { length $b <=> length $a } keys %$sm;
     my $re = join '|', map { quotemeta } @alt;
+    # where the disk ignores case (macOS), so does the match (R70)
+    my $ci = ClaudeApart::Paths::fold('A') ne 'A' ? '(?i)' : '';
+    my %lto = $ci ? map({ lc $_ => $to{$_} } keys %to) : %to;
     my @files;
     my $out = $cmd;
-    $out =~ s{(?<![\w./~\-])($re)(?![\w.\-])((?:/[^\s'"`;|&<>()\$\\*?]+)*)}{
+    $out =~ s{(?<![\w./~\-])($ci$re)(?![\w.\-])((?:/[^\s'"`;|&<>()\$\\*?]+)*)}{
         my ($sp, $tail) = ($1, $2);
         push @files, substr($tail, 1) if length $tail;
-        (exists $to{$sp} ? $to{$sp} : $sp) . $tail
+        my $k = $ci ? lc $sp : $sp;
+        (exists $lto{$k} ? $lto{$k} : $sp) . $tail
     }ge;
     return ($out, @files);
 }
@@ -373,7 +378,6 @@ sub items {
         $add->('setting', 'enabledPlugins', 'enabledPlugins', \@p);
     }
     return @out;
-
 }
 
 sub _read_state_quiet {

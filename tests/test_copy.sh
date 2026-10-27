@@ -392,3 +392,33 @@ test_utf8_names_printed_as_utf8() {
   run capart_pl copy-items personal work
   assert_contains "$OUT" "café@m" "utf8 name" || return 1
 }
+
+# ---- fix round 2 ----
+
+test_data_folder_name_in_other_case_skipped() {
+  _copy_fixture
+  _hook_settings 'x ~/.claude/Projects/-x/memory/b.md'
+  run capart_pl copy-items personal work
+  assert_not_contains "$OUT" "carries" "not carried" || return 1
+  assert_contains "$OUT" "which cannot be copied" "skipped" || return 1
+  _apply personal work hook Stop#0
+  [ "$RC" != 0 ] || return 1
+  [ ! -e "$HOME/.claude-work/projects" ] && [ ! -e "$HOME/.claude-work/Projects" ] || { echo "carried"; return 1; }
+}
+
+test_settings_name_in_other_case_skipped() {
+  _copy_fixture
+  mkdir -p "$HOME/.claude/hooks"; echo '{}' > "$HOME/.claude/hooks/Settings.json"
+  _hook_settings 'x ~/.claude/hooks/Settings.json'
+  run capart_pl copy-items personal work
+  assert_not_contains "$OUT" "carries" "not carried" || return 1
+  assert_contains "$OUT" "which cannot be copied" "skipped" || return 1
+}
+
+test_source_dir_in_other_case_counts_as_inside() {
+  [ "$(uname)" = Darwin ] || return 0
+  _copy_fixture
+  _hook_settings 'x ~/.CLAUDE/settings.json'
+  run capart_pl copy-items personal work
+  assert_contains "$OUT" "which cannot be copied" "skipped" || return 1
+}
