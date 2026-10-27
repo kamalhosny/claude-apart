@@ -1,6 +1,7 @@
 # Tests for the claude wrapper, profile resolution and identity check.
 
 _log() { cat "$FAKE_LOG" 2>/dev/null; }
+_log_cfg() { _log | sed 's/ TMPDIR_CC=.*//'; } # the log line without the temp folder part
 
 _herdr_stub() { # <label>
   cat > "$T/bin/herdr" <<STUB
@@ -14,14 +15,14 @@ test_plain_claude_uses_default() {
   t_two_profiles
   run claude --foo
   assert_rc 0 "claude" || return 1
-  assert_eq "CONFIG_DIR=$HOME/.claude-work PROFILE=work ARGS=--foo" "$(_log)" "default profile" || return 1
+  assert_eq "CONFIG_DIR=$HOME/.claude-work PROFILE=work ARGS=--foo" "$(_log_cfg)" "default profile" || return 1
 }
 
 test_launcher_personal_unsets_config_dir() {
   t_two_profiles
   run claude-personal
   assert_rc 0 "claude-personal" || return 1
-  assert_eq "CONFIG_DIR=<unset> PROFILE=personal ARGS=" "$(_log)" "personal adopted" || return 1
+  assert_eq "CONFIG_DIR=<unset> PROFILE=personal ARGS=" "$(_log_cfg)" "personal adopted" || return 1
 }
 
 test_env_profile_wins_over_default() {
@@ -148,7 +149,7 @@ test_herdr_hang_falls_back_to_default() {
 test_no_config_passthrough() {
   run claude x
   assert_rc 0 "claude" || return 1
-  assert_eq "CONFIG_DIR=<unset> PROFILE= ARGS=x" "$(_log)" "untouched" || return 1
+  assert_eq "CONFIG_DIR=<unset> PROFILE= ARGS=x" "$(_log_cfg)" "untouched" || return 1
 }
 
 test_identity_check_codes() {
@@ -221,4 +222,37 @@ test_caller_ca_vars_do_not_leak() {
   CA_ADOPTED=1 CA_DIR=/nowhere run claude-work
   assert_rc 0 "claude-work" || return 1
   assert_contains "$(_log)" "CONFIG_DIR=$HOME/.claude-work" "own values used" || return 1
+}
+
+_mode() { if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi; }
+
+test_tmpdir_per_profile() {
+  t_two_profiles
+  unset XDG_STATE_HOME
+  local n
+  for n in work personal; do
+    : > "$FAKE_LOG"
+    if [ "$n" = work ]; then run claude; else run claude-personal; fi
+    assert_rc 0 "$n" || return 1
+    assert_contains "$(_log)" "TMPDIR_CC=$HOME/.local/state/claude-apart/tmp/$n" "$n env" || return 1
+    [ -d "$HOME/.local/state/claude-apart/tmp/$n" ] || { echo "$n: folder missing"; return 1; }
+    assert_eq 700 "$(_mode "$HOME/.local/state/claude-apart/tmp/$n")" "$n mode" || return 1
+  done
+}
+
+test_tmpdir_honours_xdg_state_home() {
+  t_two_profiles
+  XDG_STATE_HOME="$T/st" run claude
+  assert_rc 0 "claude" || return 1
+  assert_contains "$(_log)" "TMPDIR_CC=$T/st/claude-apart/tmp/work" "state home" || return 1
+  assert_eq 700 "$(_mode "$T/st/claude-apart/tmp/work")" "mode" || return 1
+}
+
+test_tmpdir_failure_refuses() {
+  t_two_profiles
+  : > "$T/afile"
+  XDG_STATE_HOME="$T/afile/sub" run claude
+  assert_rc 1 "refused" || return 1
+  assert_contains "$ERR" "claude-apart: cannot create the temp folder $T/afile/sub/claude-apart/tmp/work." "message" || return 1
+  assert_eq "" "$(_log)" "real claude not run" || return 1
 }

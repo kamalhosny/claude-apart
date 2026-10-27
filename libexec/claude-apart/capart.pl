@@ -71,8 +71,9 @@ sub cmd_config {
             TAG => $p->{tag}, EMOJI => $p->{emoji}, COLOUR => $p->{colour_code},
             EMAIL => $p->{email}, ORG => $p->{org},
             CAN_READ => join(' ', @{ $p->{can_read} }), THEME => $p->{theme},
+            TMPDIR => ClaudeApart::Config::tmp_dir($p->{name}),
         );
-        print "CA_$_=" . ($_ eq "ADOPTED" ? $v{$_} : shq($v{$_})) . "\n" for qw(NAME DIR ADOPTED TAG EMOJI COLOUR EMAIL ORG CAN_READ THEME);
+        print "CA_$_=" . ($_ eq "ADOPTED" ? $v{$_} : shq($v{$_})) . "\n" for qw(NAME DIR ADOPTED TAG EMOJI COLOUR EMAIL ORG CAN_READ THEME TMPDIR);
     } elsif ($sub eq 'set') {
         return usage() unless @a == 2;
         ClaudeApart::Config::set_top($cfg, $a[0], $a[1]);

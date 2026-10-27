@@ -1051,3 +1051,22 @@ test_search_tools() {
   pre_tool work Read '{}'
   _allowed "Read with no path" || return 1
 }
+
+test_tmp_dirs_guarded() {
+  t_two_profiles
+  unset XDG_STATE_HOME
+  local uid; uid=$(perl -e 'print $<')
+  local mine="$HOME/.local/state/claude-apart/tmp/work"
+  _tool work Write file_path "/tmp/claude-$uid/x"
+  _blocked "work writes shared temp root" || return 1
+  if [ "$(uname)" = Darwin ]; then
+    _tool work Write file_path "/private/tmp/claude-$uid/x"
+    _blocked "work writes /private spelling" || return 1
+  fi
+  _tool work Write file_path "$mine/x"
+  _allowed "work writes its own tmp dir" || return 1
+  _tool personal Write file_path "$mine/x"
+  _blocked "personal writes work tmp dir" || return 1
+  _tool personal Write file_path "/tmp/claude-$uid/x"
+  _allowed "personal writes shared temp root" || return 1
+}

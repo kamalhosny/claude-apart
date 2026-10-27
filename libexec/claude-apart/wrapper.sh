@@ -26,7 +26,7 @@ case "$self" in
   *)        echo "claude-apart: unknown launcher name." >&2; exit 1 ;;
 esac
 
-unset CA_NAME CA_DIR CA_ADOPTED CA_TAG CA_EMOJI CA_COLOUR CA_EMAIL CA_ORG CA_CAN_READ CA_THEME
+unset CA_NAME CA_DIR CA_ADOPTED CA_TAG CA_EMOJI CA_COLOUR CA_EMAIL CA_ORG CA_CAN_READ CA_THEME CA_TMPDIR
 shellvars=$(capart config shell "$profile") || exit 1
 eval "$shellvars"
 
@@ -41,7 +41,12 @@ case "${args[0]:-}" in
     esac ;;
 esac
 
+(umask 077 && mkdir -p "$CA_TMPDIR") && chmod 700 "$CA_TMPDIR" || {
+  echo "claude-apart: cannot create the temp folder $CA_TMPDIR." >&2
+  exit 1
+}
 real=$(find_real_claude) || exit 1
 export CLAUDE_APART_PROFILE=$profile
+export CLAUDE_CODE_TMPDIR=$CA_TMPDIR
 if [ "$CA_ADOPTED" = 1 ]; then unset CLAUDE_CONFIG_DIR; else export CLAUDE_CONFIG_DIR=$CA_DIR; fi
 exec "$real" "${args[@]}"

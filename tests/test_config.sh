@@ -118,3 +118,40 @@ test_cli_through_symlink_finds_root() {
   assert_contains "$OUT" "Usage" "usage printed" || return 1
   [ -z "$(env | grep '^CA_ROOT=')" ] || { echo "CA_ROOT leaked into env"; return 1; }
 }
+
+_cfg_perl() { # <perl code> [args...]: run code with the loaded config in $c
+  local code=$1; shift
+  run perl -I"$REPO/lib" -MClaudeApart::Config -e 'my $c=ClaudeApart::Config::load(ClaudeApart::Config::config_path()); '"$code" -- "$@"
+}
+
+test_config_tmp_dir_state_home() {
+  t_two_profiles
+  local code='print ClaudeApart::Config::tmp_dir($ARGV[0]), "\n"'
+  XDG_STATE_HOME="$T/state" _cfg_perl "$code" work
+  assert_eq "$T/state/claude-apart/tmp/work" "$OUT" "absolute XDG_STATE_HOME" || return 1
+  XDG_STATE_HOME="relative/state" _cfg_perl "$code" work
+  assert_eq "$HOME/.local/state/claude-apart/tmp/work" "$OUT" "relative ignored" || return 1
+  XDG_STATE_HOME="" _cfg_perl "$code" work
+  assert_eq "$HOME/.local/state/claude-apart/tmp/work" "$OUT" "empty ignored" || return 1
+}
+
+test_config_owned_paths_tmp() {
+  t_two_profiles
+  unset XDG_STATE_HOME XDG_CACHE_HOME
+  local code='print "$_\n" for ClaudeApart::Config::owned_paths($c,$ARGV[0])'
+  local uid; uid=$(perl -e 'print $<')
+  local cache
+  if [ "$(uname)" = Darwin ]; then cache="$HOME/Library/Caches/claude-cli-nodejs"; else cache="$HOME/.cache/claude-cli-nodejs"; fi
+  _cfg_perl "$code" personal
+  assert_contains "$OUT" "$HOME/.local/state/claude-apart/tmp/personal"$'\n' "adopted owns its tmp dir" || return 1
+  assert_contains "$OUT" "/tmp/claude-$uid"$'\n' "adopted owns shared temp root" || return 1
+  assert_contains "$OUT" "$cache" "adopted owns cache folder" || return 1
+  _cfg_perl "$code" work
+  assert_contains "$OUT" "$HOME/.local/state/claude-apart/tmp/work" "work owns its tmp dir" || return 1
+  assert_not_contains "$OUT" "/tmp/claude-$uid" "work does not own shared root" || return 1
+  assert_not_contains "$OUT" "claude-cli-nodejs" "work does not own cache" || return 1
+  local wcode='my ($r,$w)=ClaudeApart::Config::foreign_paths($c,$ARGV[0]); print "W:$_\n" for @$w;'
+  _cfg_perl "$wcode" work
+  assert_contains "$OUT" "W:/tmp/claude-$uid"$'\n' "work: shared root write-denied" || return 1
+  assert_contains "$OUT" "W:$cache" "work: cache write-denied" || return 1
+}

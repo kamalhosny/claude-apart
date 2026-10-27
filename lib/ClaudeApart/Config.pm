@@ -115,15 +115,36 @@ sub default_profile {
     return (defined $cfg->{default} && length $cfg->{default}) ? $cfg->{default} : undef;
 }
 
+# Per-profile temp folder (not created here); the wrapper hands it to Claude Code.
+sub tmp_dir {
+    my ($name) = @_;
+    my $s = $ENV{XDG_STATE_HOME};
+    my $state = (defined $s && $s =~ m{^/}) ? $s : "$ENV{HOME}/.local/state";
+    return "$state/claude-apart/tmp/$name";
+}
+
+# Claude Code's shared cache folder.
+sub _cache_dir {
+    return "$ENV{HOME}/Library/Caches/claude-cli-nodejs" if $^O eq 'darwin';
+    my $c = $ENV{XDG_CACHE_HOME};
+    my $base = (defined $c && $c =~ m{^/}) ? $c : "$ENV{HOME}/.cache";
+    return "$base/claude-cli-nodejs";
+}
+
 # Absolute paths a profile owns. An entry ending in ".*" names a family: the
 # path without ".*" plus every sibling "<that path>.<anything>". The adopted
 # profile owns the whole ~/.claude.json family, because Claude Code keeps
 # copies of the identity file next to it (.backup, .tmp.<pid>.<hex>).
+# Every profile also owns its own temp folder. The adopted profile owns the old
+# shared temp root and Claude's shared cache too: a session started without
+# the wrapper falls back to it, so those leftovers count as private.
 sub owned_paths {
     my ($cfg, $name) = @_;
     my $p = profile($cfg, $name) or die "unknown profile: $name\n";
     my @o = ($p->{abs_dir});
     push @o, "$ENV{HOME}/.claude.json", "$ENV{HOME}/.claude.json.*" if $p->{adopted};
+    push @o, tmp_dir($name);
+    push @o, "/tmp/claude-$<", _cache_dir() if $p->{adopted};
     push @o, @{ $p->{protect} };
     return @o;
 }

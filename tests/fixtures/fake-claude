@@ -1,6 +1,6 @@
 #!/bin/bash
 # Stand-in for the real Claude Code binary, used only by tests.
-echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>} PROFILE=${CLAUDE_APART_PROFILE-} ARGS=$*" >> "${FAKE_LOG:-/dev/null}"
+echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>} PROFILE=${CLAUDE_APART_PROFILE-} ARGS=$* TMPDIR_CC=${CLAUDE_CODE_TMPDIR-<unset>}" >> "${FAKE_LOG:-/dev/null}"
 if [ "$1" = auth ]; then
   if [ -n "${CLAUDE_CONFIG_DIR-}" ]; then idf="$CLAUDE_CONFIG_DIR/.claude.json"; else idf="$HOME/.claude.json"; fi
   case "$2" in
