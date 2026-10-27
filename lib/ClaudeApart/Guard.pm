@@ -47,7 +47,8 @@ my %EVAL_NAME  = map { $_ => 1 } qw(eval trap watch alias);
 # to block. $sh->{segments} holds the simple commands; see _analyse. Later
 # tasks add rules here.
 our @SHELL_RULES = (\&_rule_read_denied, \&_rule_write_denied, \&_rule_recursive_reader,
-                    \&_rule_recursive_modifier, \&_rule_launcher, \&_rule_env, \&_rule_herdr);
+                    \&_rule_recursive_modifier, \&_rule_launcher, \&_rule_env, \&_rule_env_clear,
+                    \&_rule_herdr);
 
 sub verdict {
     my ($cfg, $profile, $tool, $input, $cwd) = @_;
@@ -716,12 +717,13 @@ my $FIND_EXEC    = qr/\A-(?:exec|execdir|ok|okdir)\z/;
 my %FEEDS_ARGS   = map { $_ => 1 } qw(xargs parallel);
 my $ASSIGN       = qr/\A[A-Za-z_][A-Za-z0-9_]*\+?=/;
 my %CMD_PREFIX   = map { $_ => 1 } qw(! { do then else elif if while until time exec command builtin
-    nohup env sudo nice noglob nocorrect);
+    nohup env sudo nice noglob nocorrect timeout caffeinate ionice);
 
 # R53: the index of the command word of a simple command: the first word
 # after VAR=… words, shell keywords (do, then, if, {, !, …) and plain
-# prefixes (env, nohup, sudo, …, with -options right after them). It is
-# past the end when there is none.
+# prefixes (env, nohup, sudo, timeout, …, with -options right after them).
+# It is past the end when there is none. An option value (nice -n 5) is
+# taken as the command word.
 sub _cmd_index {
     my ($w) = @_;
     my ($i, $prefix) = (0, 0);
@@ -820,6 +822,49 @@ sub _rule_env {
     return (!$seen && $sh->{text} =~ $ENV_NAME) ? 1 : 0;    # a mention no word showed
 }
 
+# R54 (c): env -i, env -, env --ignore-environment and exec -c drop the
+# session's profile variables, so a later claude or claude-… word in the
+# same command would not know its profile. Blocked, also in code inside it
+# (env -i bash -c "claude …"). env -i without a claude word passes.
+my $CLAUDE_TOKEN  = qr/(?<![\w.])claude(?![\w.])/i;
+my %ENV_VALUE_OPT = map { $_ => 1 } qw(-u -C -S -P --unset --chdir --split-string);
+
+sub _rule_env_clear {
+    my ($ctx, $sh) = @_;
+    for my $seg (@{ $sh->{segments} }) {
+        return 1 if _env_clear_claude([ map { $_->{w} } @{ $seg->{words} } ]);
+    }
+    return 0;
+}
+
+sub _env_clear_claude {
+    my ($w) = @_;
+    for my $j (0 .. $#$w) {
+        my $n = _name($w->[$j]) // next;
+        next unless ($n eq 'env' || $n eq 'exec') && _clears_env($w, $j, $n eq 'exec');
+        return 1 if grep { $_ =~ $CLAUDE_TOKEN } @$w[ $j + 1 .. $#$w ];
+    }
+    return 0;
+}
+
+# Do the options after env (or exec) at $j clear the environment?
+sub _clears_env {
+    my ($w, $j, $exec) = @_;
+    for (my $i = $j + 1; $i < @$w; $i++) {
+        my $x = $w->[$i];
+        if ($exec) {
+            return 1 if $x =~ /\A-[A-Za-z]*c[A-Za-z]*\z/;
+            return 0 unless $x =~ /\A-/;
+            $i++ if $x eq '-a';
+            next;
+        }
+        return 1 if $x eq '-' || $x eq '--ignore-environment' || $x =~ /\A-[A-Za-z0-9]*i[A-Za-z0-9]*\z/;
+        if ($x =~ /\A-/) { $i++ if $ENV_VALUE_OPT{$x}; next }
+        return 0 unless $x =~ $ASSIGN;
+    }
+    return 0;
+}
+
 # CLAUDE_APART_PROFILE=<own name>, or CLAUDE_CONFIG_DIR=<the own dir>
 # (absolute after ~ or $HOME, in any spelling that resolves to it).
 sub _own_assignment {
@@ -847,10 +892,10 @@ sub _own_assignment {
 #   $HERDR_PANE_ID and the like may be read;
 # - R47: herdr runs in the open. Blocked: herdr glued after = (h=herdr),
 #   command words that cannot be known, and a herdr read or input command
-#   right after a command word that cannot be known ($H pane read …,
-#   "$(which herdr)" pane read …; R53: not after a later word, as in
-#   `git -C "$R" worktree remove x`) or at the start of a command (the rest
-#   of `$(…) pane read …`).
+#   after a word that may run herdr unseen (see _unknown_runner_before).
+# - R54 (b, c): text typed into a pane (pane run, send-text, send-keys;
+#   agent prompt, send-keys) runs in a plain shell, with no session check
+#   behind it: see _typed_blocks.
 # - R49: herdr after find -exec, or last under xargs/parallel, blocks (see
 #   _fed_words); any other last herdr word passes (bare `herdr` needs a
 #   terminal; `ls ~/.config/herdr`, `command -v herdr`).
@@ -864,7 +909,7 @@ sub _rule_herdr {
         for my $k (0 .. $#it) {
             next if $it[$k]{nested};
             if ($w[$k] !~ $HERDR_WORD) {
-                return 1 if ($k == 0 || ($k - 1 == $ci && $w[ $k - 1 ] =~ /[\$`]/))
+                return 1 if _unknown_runner_before(\@w, $k, $ci)
                     && ClaudeApart::Herdr::command_kind(@w[ $k .. $#w ]) ne 'other';
                 next;
             }
@@ -886,6 +931,7 @@ sub _rule_herdr {
     my %readable = map { $_ => 1 } $own, @{ ClaudeApart::Config::profile($ctx->{cfg}, $own)->{can_read} };
     for my $c (@calls) {
         for my $e (@{ $c->{env} }) { return 1 if !defined $e || $e =~ /[\$`]|\AHERDR_/ }
+        for my $t (@{ $c->{text} }) { return 1 if _typed_blocks($own, $t, 0) }
         for my $l (@{ $c->{labels} }) {
             my $p = defined $l ? ClaudeApart::Herdr::profile_for_label($ctx->{cfg}, $l) : undef;
             return 1 unless defined $p && $p eq $own;
@@ -896,6 +942,46 @@ sub _rule_herdr {
             my $p = ClaudeApart::Herdr::profile_of_target($ctx->{cfg}, $t->[1], $t->[0]);
             return 1 unless defined $p;
             return 1 if $c->{kind} eq 'input' ? $p ne $own : !$readable{$p};
+        }
+    }
+    return 0;
+}
+
+# R47/R53/R54 (a): may the word before $k run herdr under a name no one can
+# see? Yes at the start of a command; after a fed word (find -exec …); and
+# after a word with $ or ` that is the command word, or that is no option
+# and does not follow one (nice -n 5 $H …, xargs "$(…)" …). After an
+# option's value it may not (`git -C "$R" worktree remove x`).
+sub _unknown_runner_before {
+    my ($w, $k, $ci) = @_;
+    return 1 if $k == 0 || _fed_words($w, $k - 1);
+    my $p = $w->[ $k - 1 ];
+    return 0 unless $p =~ /[\$`]/;
+    return 1 if $k - 1 == $ci;
+    return ($p !~ /\A-/ && !($k >= 2 && $w->[ $k - 2 ] =~ /\A-/)) ? 1 : 0;
+}
+
+# R54 (b, c): in each simple command of typed text (and of code inside
+# it), a command word named claude-… (after quotes and backslashes are
+# removed) must be the own launcher, so claude-$P, claude-${P:-x} and
+# cl\aude-work block; env -i / exec -c may not come before a claude word.
+# Plain `claude` resolves by the pane's workspace, which input already
+# checks.
+sub _typed_blocks {
+    my ($own, $text, $depth) = @_;
+    return 1 if $depth > $MAX_DEPTH;
+    my @segs = ([]);
+    for my $t (ClaudeApart::Paths::shell_words($text)) {
+        if ($t->[1]) { push @segs, [] } else { push @{ $segs[-1] }, $t->[0] }
+    }
+    for my $w (grep { @$_ } @segs) {
+        my $ci = _cmd_index($w);
+        my $n = $ci < @$w ? _name($w->[$ci]) // '' : '';
+        return 1 if $n =~ /\Aclaude-/i && $n ne "claude-$own";
+        return 1 if _env_clear_claude($w);
+        my @code = _code_flags($w);
+        for my $i (0 .. $#$w) {
+            return 1 if ($code[$i] || $w->[$i] =~ $CODE) && _typed_blocks($own, $w->[$i], $depth + 1);
         }
     }
     return 0;

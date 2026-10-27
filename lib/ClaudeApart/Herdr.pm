@@ -132,6 +132,8 @@ my %TYPE = (pane => 'pane', agent => 'agent', workspace => 'workspace', tab => '
 # Commands that write a workspace label with --label (`workspace rename`
 # takes it as a positional; `pane move` only with --new-workspace).
 my %LABEL_OPT = map { $_ => 1 } 'workspace create', 'worktree create', 'worktree open';
+# Commands that type text into a pane or agent (R54 b): their positionals.
+my %TYPED = map { $_ => 1 } 'pane run', 'pane send-text', 'pane send-keys', 'agent prompt', 'agent send-keys';
 # Options that take a value, and the kind of id the id options name.
 my %ID_OPT = ('--pane' => 'pane', '--source-pane' => 'pane', '--target-pane' => 'pane',
               '--tab' => 'tab', '--workspace' => 'workspace');
@@ -186,13 +188,16 @@ sub command_kind { return (_kind(@_))[0] }
 #              ($HERDR_PANE_ID). R51 defaults: `pane split` with no pane
 #              takes $HERDR_PANE_ID, `worktree create|open` with no
 #              --workspace takes $HERDR_WORKSPACE_ID, and `tab create` with
-#              no --workspace gets an unknown target. type is 'pane',
+#              no --workspace (and R54 d: `pane move --new-tab` with no
+#              --workspace) gets an unknown target. type is 'pane',
 #              'agent', 'tab', 'workspace' or 'terminal'; an undef id cannot
 #              be known (blocks);
 #   target  => the first target id;
 #   labels  => the workspace labels the command writes (undef: cannot be
 #              known, or herdr picks one itself);
-#   env     => the --env values, as written.
+#   env     => the --env values, as written;
+#   text    => for commands that type into a pane or agent, every
+#              positional after the command words (target and payload).
 # An unknown option in a read or input command gives an undef target,
 # because it may take the next word as its value.
 sub parse_command {
@@ -219,7 +224,7 @@ sub parse_command {
         push @pos, $w;
     }
     my %r = (machine => $machine, targets => \@targets, labels => \@labels,
-             env => [ @{ $opt{'--env'} || [] } ]);
+             env => [ @{ $opt{'--env'} || [] } ], text => []);
     my $head = (($pos[0] // '') eq 'terminal' && ($pos[1] // '') eq 'session') ? 3 : 2;
     my @head = @pos > $head ? @pos[ 0 .. $head - 1 ] : @pos;
     if (grep { /[\$`]/ || $_ eq '{}' } @head) {
@@ -230,6 +235,7 @@ sub parse_command {
     my $cmd = @pos >= 2 ? "$pos[0] $pos[1]" : '';
     $kind = 'other' if $cmd eq 'agent explain' && $opt{'--file'} && @pos <= $n;    # reads a file
     $r{kind} = $kind;
+    $r{text} = [ @pos[ $n .. $#pos ] ] if $TYPED{$cmd};
     if ($cmd eq 'workspace rename') {
         push @labels, @pos == 4 ? _value($pos[3]) : undef;
     } elsif ($LABEL_OPT{$cmd} || ($cmd eq 'pane move' && $opt{'--new-workspace'})) {
@@ -247,6 +253,7 @@ sub parse_command {
     push @targets, [ 'pane', _value('$HERDR_PANE_ID') ] if $opt{'--current'};
     push @targets, [ 'pane', _value('$HERDR_PANE_ID') ] if $cmd eq 'pane split' && !@targets;
     push @targets, [ undef, undef ] if $cmd eq 'tab create' && !$opt{'--workspace'};
+    push @targets, [ undef, undef ] if $cmd eq 'pane move' && $opt{'--new-tab'} && !$opt{'--workspace'};
     push @targets, [ 'workspace', _value('$HERDR_WORKSPACE_ID') ]
         if $cmd =~ /\Aworktree (?:create|open)\z/ && !$opt{'--workspace'};
     push @targets, [ undef, undef ] if $unknown;

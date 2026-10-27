@@ -61,6 +61,16 @@ _herdr_script() { # <bash body>: a custom stub
   chmod +x "$T/bin/herdr"
 }
 
+_lines() { # <profile> <block|allow>: run each line of stdin as a Bash command (no quoting games)
+  local p=$1 want=$2 c i=0
+  local -a cmds
+  while IFS= read -r c; do [ -n "$c" ] && cmds[i++]=$c; done
+  for c in "${cmds[@]}"; do
+    _run_bash "$p" "$c" "${CWD:-}"
+    if [ "$want" = block ]; then _expect_block "$p: $c" || return 1; else _expect_allow "$p: $c" || return 1; fi
+  done
+}
+
 _all_gone() { # <pid file>: every pid in it has exited (waits up to 3 s each)
   local p i
   for p in $(cat "$1"); do
@@ -286,7 +296,8 @@ test_herdr_label_must_be_own() { # R45: every workspace label herdr writes start
   _allows personal 'herdr workspace create --label "🟪 PERS · x" --cwd /tmp --no-focus' \
     'herdr worktree create --workspace w2 --branch b --label "🟪 PERS · b"' \
     'herdr worktree open --workspace w2 --path /tmp/wt --label "🟪 PERS"' \
-    'herdr tab create --workspace w2 --label notes' 'herdr pane move w2:p1 --new-tab --label notes' || return 1
+    'herdr tab create --workspace w2 --label notes' 'herdr pane move w2:p1 --new-tab --workspace w2 --label notes' \
+    || return 1
   _blocks work 'herdr workspace create --label "🟪 PERS · x"' || return 1
 }
 
@@ -384,6 +395,91 @@ test_launcher_rest_only_in_command_word() { # R53: claude-<unknown> counts only 
     'find . -exec claude-$p {} \;' 'find . -execdir claude- \;'; do
     _run_bash work "$c" "$d"; _expect_block "work in proj: $c" || return 1
   done
+}
+
+test_tail_rule_fed_and_runner_words() { # R54 (a): a herdr verb after a fed word or a runner's non-literal word
+  t_two_profiles
+  _herdr_std
+  _lines personal block <<'EOF' || return 1
+nice -n 5 "$(command -v herdr)" pane run w1:p2 "claude -p hi"
+nice -n 5 $H pane run w1:p2 "claude -p hi"
+sudo -u me $H pane run w1:p2 "claude -p hi"
+exec -a x $H pane run w1:p2 "claude -p hi"
+env -u FOO $H pane run w1:p2 "claude -p hi"
+timeout 5 $H pane run w1:p2 "claude -p hi"
+caffeinate -i $H pane run w1:p2 "claude -p hi"
+ionice $H pane run w1:p2 "claude -p hi"
+xargs "$(command -v herdr)" pane run w1:p2 "claude -p hi" </dev/null
+EOF
+  mkdir -p "$T/proj"
+  CWD="$T/proj" _lines personal block <<'EOF' || return 1
+find . -maxdepth 0 -exec "$(command -v herdr)" pane run w1:p2 "claude -p hi" \;
+find . -maxdepth 0 -exec $H pane run w1:p2 "claude -p hi" \;
+EOF
+  _lines personal allow <<'EOF' || return 1
+git -C "$REPO" worktree remove .worktrees/x
+git -C "$(pwd)" worktree remove x
+git --git-dir=$G worktree remove x
+EOF
+}
+
+test_typed_text_launchers() { # R54 (b): a claude-… command typed into a pane must be the own launcher
+  t_two_profiles
+  _herdr_std
+  _lines personal block <<'EOF' || return 1
+herdr pane run w2:p2 'claude-$P'
+herdr pane run w2:p2 "claude-\${P:-work}"
+herdr pane send-text w2:p2 'claude-$P'
+herdr pane run w2:p2 'cl\aude-work'
+herdr pane run w2:p2 "c'laude-w'ork -p hi"
+herdr pane run w2:p2 'cd /tmp && /opt/bin/claude-work -p hi'
+herdr pane run w2:p2 "bash -c 'claude-work -p hi'"
+herdr pane run w2:p2 'X=1 nohup claude-work'
+herdr pane send-keys w2:p2 'claude-work -p hi' Enter
+herdr agent prompt rev 'claude-work -p hi'
+herdr agent send-keys rev 'claude-${P}' Enter
+herdr pane run w2:p2 'CLAUDE-PERSONAL -p hi'
+EOF
+  _lines personal allow <<'EOF' || return 1
+herdr pane run w2:p2 'claude-personal -p hi'
+herdr pane run w2:p2 'claude -p hi'
+herdr pane run w2:p2 'grep -n claude-$P notes.txt'
+herdr agent prompt rev 'please run claude-$P later'
+herdr pane send-keys w2:p2 Enter
+EOF
+}
+
+test_env_clear_with_claude_blocked() { # R54 (c): env -i / env - / exec -c with a later claude word
+  t_two_profiles
+  _herdr_std
+  _lines personal block <<'EOF' || return 1
+env -i HOME=$HOME PATH=$PATH claude -p hi
+env - claude -p hi
+env --ignore-environment claude
+/usr/bin/env -i claude-personal
+env -u X -i claude
+env -iv claude
+env -i bash -c "claude -p hi"
+exec -c claude -p hi
+exec -a x -c claude-personal
+herdr pane run w2:p2 'env -i PATH=/usr/bin:/bin claude -p hi'
+herdr pane run w2:p2 'exec -c claude'
+EOF
+  _lines personal allow <<'EOF' || return 1
+env -i FOO=1 ls
+env FOO=1 claude -p hi
+exec -a x ls
+env -i ls notes.claude.txt
+herdr pane run w2:p2 'env -i FOO=1 ls'
+EOF
+}
+
+test_pane_move_new_tab_needs_workspace() { # R54 (d)
+  t_two_profiles
+  _herdr_std
+  _blocks personal 'herdr pane move w2:p1 --new-tab' 'herdr pane move w2:p1 --new-tab --label notes' \
+    'herdr pane move w2:p1 --new-tab --workspace w1' || return 1
+  _allows personal 'herdr pane move w2:p1 --new-tab --workspace w2' || return 1
 }
 
 test_herdr_terminal_and_other_groups() {
