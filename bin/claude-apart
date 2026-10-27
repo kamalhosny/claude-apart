@@ -6,7 +6,7 @@ usage() {
   cat <<'USAGE'
 Usage: claude-apart <command>
 
-  setup | add <name> | remove <name> | login <name> | status | sync | copy <from> <to> | check | new <name>
+  setup | add <name> | remove <name> | login <name> | status | sync | copy <from> <to> | check | new <name> | uninstall [--purge]
 
 Run several Claude Code accounts side by side.
 Run claude-apart help for this text.
@@ -27,6 +27,7 @@ case "${1:-}" in
   check) . "$CA_ROOT/libexec/claude-apart/cmd/check.sh"; shift; ca_check "$@"; exit $? ;;
   copy) . "$CA_ROOT/libexec/claude-apart/cmd/copy.sh"; shift; ca_copy "$@"; exit $? ;;
   new) . "$CA_ROOT/libexec/claude-apart/cmd/new.sh"; shift; ca_new "$@"; exit $? ;;
+  uninstall) . "$CA_ROOT/libexec/claude-apart/cmd/uninstall.sh"; shift; ca_uninstall "$@"; exit $? ;;
   login|add|remove|setup|status)
     c=$1; shift
     . "$CA_ROOT/libexec/claude-apart/cmd/$c.sh"
