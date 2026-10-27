@@ -89,10 +89,28 @@ sub _hook {
 
 sub _pre {
     my ($profile, $cwd, $tool, $input) = @_;
-    my ($rc) = _hook(undef, $profile, 'pre-tool',
+    return _hook(undef, $profile, 'pre-tool',
         { hook_event_name => 'PreToolUse', cwd => $cwd, tool_name => $tool, tool_input => $input });
-    return $rc;
 }
+
+# A real block: rc 2 with the guard's block text. A crash also gives rc 2, with
+# the guard-error text, and must not count.
+sub _blocked { my ($rc, $out) = @_; return $rc == 2 && index($out, 'this touches another profile') >= 0 }
+
+# Shell spellings of a path for the probe commands.
+sub _sq { my $s = shift; $s =~ s/'/'\\''/g; return "'$s'" }
+sub _dq { my $s = shift; $s =~ s/([\\"\$`])/\\$1/g; return $s }    # inside "..."
+sub _bs { my $s = shift; $s =~ s/([^\w.\/\-])/\\$1/g; return $s }  # unquoted
+
+# Where Claude Code reads managed settings from. CLAUDE_APART_TEST_MANAGED_SETTINGS
+# replaces the path; it is for tests only.
+sub _managed_file {
+    my $t = $ENV{CLAUDE_APART_TEST_MANAGED_SETTINGS};
+    return $t if defined $t && length $t;
+    return $^O eq 'darwin' ? '/Library/Application Support/ClaudeCode/managed-settings.json' : '/etc/claude-code/managed-settings.json';
+}
+
+my %INSTALLED;    # profile -> { event -> installed command }, filled by check (a)
 
 sub _say {
     my ($ok, $profile, $text) = @_;
@@ -145,16 +163,29 @@ sub _check_settings {
         my $cmd = ref $st->{hooks} eq 'HASH' ? $st->{hooks}{$ev} : undef;
         my $has = 0;
         if (defined $cmd && ref $d->{hooks} eq 'HASH' && ref $d->{hooks}{$ev} eq 'ARRAY') {
+            # the whole entry as install writes it, not only the command
             for my $e (@{ $d->{hooks}{$ev} }) {
-                next unless ref $e eq 'HASH' && ref $e->{hooks} eq 'ARRAY';
-                for my $h (@{ $e->{hooks} }) { $has = 1 if ref $h eq 'HASH' && defined $h->{command} && $h->{command} eq $cmd }
+                next unless ref $e eq 'HASH' && ref $e->{hooks} eq 'ARRAY' && defined $e->{matcher} && $e->{matcher} eq '*';
+                for my $h (@{ $e->{hooks} }) {
+                    next unless ref $h eq 'HASH' && defined $h->{command} && $h->{command} eq $cmd;
+                    next unless defined $h->{type} && $h->{type} eq 'command' && defined $h->{timeout} && $h->{timeout} eq '10';
+                    $has = 1;
+                    $INSTALLED{$name}{$ev} = $cmd;
+                }
             }
         }
-        push @bad, "$ev hook missing" unless $has;
+        push @bad, "$ev hook missing, disabled or changed" unless $has;
     }
     my $sl = ref $st->{statusLine_set} eq 'HASH' ? $st->{statusLine_set}{command} : undef;
     push @bad, 'status line changed'
         unless defined $sl && ref $d->{statusLine} eq 'HASH' && defined $d->{statusLine}{command} && $d->{statusLine}{command} eq $sl;
+    for my $k (qw(disableAllHooks allowManagedHooksOnly)) {
+        push @bad, "$k is on in settings.json" if $d->{$k};
+    }
+    my $m = _read_json(_managed_file());
+    for my $k (qw(disableAllHooks allowManagedHooksOnly)) {
+        push @bad, "$k is on in the managed settings" if $m && $m->{$k};
+    }
     push @bad, 'theme changed' if length $p->{theme} && (!defined $d->{theme} || $d->{theme} ne $p->{theme});
     _report($name, 'settings hold the guard entries', 'settings differ from the installed state (run: claude-apart sync)', @bad);
 }
@@ -164,27 +195,29 @@ sub _check_reads {
     my ($name, $read) = @_;
     my $home = $ENV{HOME};
     my (@fails, $n);
+    $n = 0;
     for my $r (@$read) {
         my ($root, $file) = _target($r);
         my $x = $file ? $root : "$root/x";
         my @probes = (
             ['Read', { file_path => $x }, $home, 'Read'],
-            ['Bash', { command => "cat $x" }, $home, 'cat'],
-            ['Bash', { command => "grep -r x $root" }, $home, 'grep -r'],
-            ['Bash', { command => "ls $root" }, $home, 'ls'],
+            ['Bash', { command => 'cat ' . _sq($x) }, $home, 'cat'],
+            ['Bash', { command => 'grep -r x ' . _sq($root) }, $home, 'grep -r'],
+            ['Bash', { command => 'ls ' . _sq($root) }, $home, 'ls'],
             ['Bash', { command => "python3 -c \"print(open('$x').read())\"" }, $home, 'python3 open()'],
         );
         if (index($x, "$home/") == 0) {
             my $rel = substr($x, length($home) + 1);
-            push @probes, ['Bash', { command => "cat \$HOME/$rel" }, '/', '$HOME spelling'],
-                          ['Bash', { command => "cat \${HOME}/$rel" }, '/', '${HOME} spelling'],
-                          ['Bash', { command => "cat ~/$rel" }, '/', '~ spelling'];
+            my $q = _dq($rel);
+            push @probes, ['Bash', { command => "cat \"\$HOME/$q\"" }, '/', '$HOME spelling'],
+                          ['Bash', { command => "cat \"\${HOME}/$q\"" }, '/', '${HOME} spelling'],
+                          ['Bash', { command => 'cat ~/' . _bs($rel) }, '/', '~ spelling'];
         }
-        push @probes, ['Bash', { command => 'cat ' . basename($root) . ($file ? '' : '/x') }, dirname($root), 'relative cat'];
+        push @probes, ['Bash', { command => 'cat ' . _sq(basename($root) . ($file ? '' : '/x')) }, dirname($root), 'relative cat'];
         for my $pr (@probes) {
             $n++;
-            my $rc = _pre($name, $pr->[2], $pr->[0], $pr->[1]);
-            push @fails, "$pr->[3] on $root not blocked (rc $rc)" unless $rc == 2;
+            my ($rc, $out) = _pre($name, $pr->[2], $pr->[0], $pr->[1]);
+            push @fails, "$pr->[3] on $root not blocked (rc $rc)" unless _blocked($rc, $out);
         }
     }
     _report($name, "read probes blocked (" . scalar(@$read) . " roots, $n calls)", 'read probes not blocked', @fails);
@@ -196,8 +229,8 @@ sub _check_writes {
     my @fails;
     for my $r (@$write) {
         my ($root, $file) = _target($r);
-        my $rc = _pre($name, $ENV{HOME}, 'Write', { file_path => $file ? $root : "$root/x", content => 'x' });
-        push @fails, "Write into $root not blocked (rc $rc)" unless $rc == 2;
+        my ($rc, $out) = _pre($name, $ENV{HOME}, 'Write', { file_path => $file ? $root : "$root/x", content => 'x' });
+        push @fails, "Write into $root not blocked (rc $rc)" unless _blocked($rc, $out);
     }
     _report($name, 'writes blocked (' . scalar(@$write) . ' roots)', 'writes not blocked', @fails);
 }
@@ -205,8 +238,27 @@ sub _check_writes {
 # (d) the profile's own folder is readable.
 sub _check_own {
     my ($name, $p) = @_;
-    my $rc = _pre($name, $ENV{HOME}, 'Read', { file_path => "$p->{abs_dir}/x" });
+    my ($rc) = _pre($name, $ENV{HOME}, 'Read', { file_path => "$p->{abs_dir}/x" });
     _say($rc == 0, $name, $rc == 0 ? 'own folder readable' : "own folder not readable (rc $rc)");
+}
+
+# The INSTALLED PreToolUse command, run as Claude Code runs it (through sh),
+# must block a deny case with the guard's block text. A stale or missing
+# command fails here: its `|| exit 2` suffix gives rc 2 but another text.
+sub _check_installed {
+    my ($name, $read, $write) = @_;
+    my $cmd = $INSTALLED{$name} && $INSTALLED{$name}{PreToolUse};
+    return _say(0, $name, 'no installed PreToolUse command to run') unless defined $cmd;
+    my ($tool, $input);
+    if (@$read) { my ($r, $f) = _target($read->[0]); ($tool, $input) = ('Read', { file_path => $f ? $r : "$r/x" }) }
+    elsif (@$write) { my ($r, $f) = _target($write->[0]); ($tool, $input) = ('Write', { file_path => $f ? $r : "$r/x", content => 'x' }) }
+    else { return _say(1, $name, 'installed PreToolUse command: no deny case to try') }
+    my ($rc, $out) = _run({ _clean_env() }, JSON::PP->new->utf8->encode(
+        { hook_event_name => 'PreToolUse', cwd => $ENV{HOME}, tool_name => $tool, tool_input => $input }),
+        '/bin/sh', '-c', $cmd);
+    my $ok = _blocked($rc, $out);
+    _say($ok, $name, $ok ? 'installed PreToolUse command blocks a deny case'
+        : "installed PreToolUse command does not block a deny case (rc $rc; run: claude-apart sync)");
 }
 
 # (e) a session of this profile cannot start another profile's launcher.
@@ -270,14 +322,24 @@ sub _check_scratch {
         my @fails;
         my $wrapper = sub { my ($rc, $out) = _run(\%env, '', "$TMP/g/links/claude-$n"); return ($rc != 0 && index($out, $msg) >= 0) };
         my $prompt = sub {
-            my ($rc) = _hook(\%env, $n, 'prompt', { hook_event_name => 'UserPromptSubmit', cwd => $home, prompt => 'hi' });
-            return $rc == 2;
+            my ($rc, $out) = _hook(\%env, $n, 'prompt', { hook_event_name => 'UserPromptSubmit', cwd => $home, prompt => 'hi' });
+            return $rc == 2 && index($out, $msg) >= 0;
+        };
+        # the installed UserPromptSubmit command itself, pointed at the scratch HOME
+        my $icmd = $INSTALLED{$n} && $INSTALLED{$n}{UserPromptSubmit};
+        my $installed = sub {
+            return _run(\%env, JSON::PP->new->utf8->encode({ hook_event_name => 'UserPromptSubmit', cwd => $home, prompt => 'hi' }),
+                '/bin/sh', '-c', $icmd);
         };
         my $write = sub { open my $fh, '>', $idfile or die "cannot write scratch file\n"; print $fh $_[0]; close $fh };
         # wrong identity
         $write->('{"oauthAccount":{"emailAddress":"wrong@example.com","organizationUuid":"org-wrong"}}');
         push @fails, 'wrong identity not refused by the wrapper' unless $wrapper->();
         push @fails, 'wrong identity not blocked by hook prompt' unless $prompt->();
+        if (defined $icmd) {
+            my ($rc, $out) = $installed->();
+            push @fails, "installed prompt command did not block a wrong identity (rc $rc)" unless $rc == 2 && index($out, $msg) >= 0;
+        } else { push @fails, 'no installed prompt command to run' }
         # missing identity
         unlink $idfile;
         push @fails, 'missing identity not refused by the wrapper' unless $wrapper->();
@@ -287,6 +349,10 @@ sub _check_scratch {
             $write->(JSON::PP->new->utf8->encode({ oauthAccount => { emailAddress => $p->{email}, organizationUuid => $p->{org} } }));
             push @fails, 'matching identity was refused (control)' if $wrapper->();
             push @fails, 'matching identity blocked by hook prompt (control)' if $prompt->();
+            if (defined $icmd) {
+                my ($rc) = $installed->();
+                push @fails, "installed prompt command blocked a matching identity (rc $rc)" unless $rc == 0;
+            }
             unlink $idfile;
         }
         _report($n, 'wrong and missing identity refused (scratch copy)', 'identity rules', @fails);
@@ -307,6 +373,7 @@ sub run {
         my $p = ClaudeApart::Config::profile($cfg, $name);
         my ($read, $write) = ClaudeApart::Config::foreign_paths($cfg, $name);
         _check_settings($cfg, $name, $p, $read, $write);
+        _check_installed($name, $read, $write);
         _check_reads($name, $read);
         _check_writes($name, $write);
         _check_own($name, $p);

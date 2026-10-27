@@ -176,3 +176,88 @@ test_new_inside_session_only_own_profile() {
   CLAUDE_CODE_CHILD_SESSION=1 CLAUDE_CONFIG_DIR="$HOME/nowhere" run claude-apart new work
   assert_rc 1 "unknown own profile refused" || return 1
 }
+
+# Edits the work profile's settings.json with a perl snippet ($d = the decoded hash).
+_edit_work_settings() { # <perl code>
+  perl -MJSON::PP -e '
+    my ($f, $code) = @ARGV; local $/; open my $h, "<", $f or die; my $d = decode_json(<$h>); close $h;
+    eval $code; die $@ if $@;
+    open $h, ">", $f or die; print $h encode_json($d); close $h' "$HOME/.claude-work/settings.json" "$1"
+}
+
+test_check_fails_when_matcher_changed_and_hooks_disabled() {
+  _synced || return 1
+  _edit_work_settings '$_->{matcher} = "NoSuchTool" for @{ $d->{hooks}{PreToolUse} }; $d->{disableAllHooks} = JSON::PP::true;'
+  run claude-apart check
+  assert_rc 1 "check" || return 1
+  assert_contains "$OUT" "✗ work:" "names work" || return 1
+}
+
+test_check_fails_when_only_matcher_changed() {
+  _synced || return 1
+  _edit_work_settings '$_->{matcher} = "NoSuchTool" for @{ $d->{hooks}{PreToolUse} };'
+  run claude-apart check
+  assert_rc 1 "check" || return 1
+  assert_contains "$OUT" "✗ work: settings" "settings line fails" || return 1
+}
+
+test_check_fails_when_timeout_changed() {
+  _synced || return 1
+  _edit_work_settings '$_->{timeout} = 1 for map { @{ $_->{hooks} } } @{ $d->{hooks}{UserPromptSubmit} };'
+  run claude-apart check
+  assert_rc 1 "check" || return 1
+}
+
+test_check_fails_on_disable_all_hooks() {
+  _synced || return 1
+  _edit_work_settings '$d->{disableAllHooks} = JSON::PP::true;'
+  run claude-apart check
+  assert_rc 1 "check" || return 1
+  assert_contains "$OUT" "disableAllHooks" "names the key" || return 1
+}
+
+test_check_fails_on_managed_hooks_only() {
+  _synced || return 1
+  echo '{"allowManagedHooksOnly":true}' > "$T/managed.json"
+  CLAUDE_APART_TEST_MANAGED_SETTINGS="$T/managed.json" run claude-apart check
+  assert_rc 1 "check" || return 1
+  assert_contains "$OUT" "allowManagedHooksOnly" "names the key" || return 1
+  echo '{}' > "$T/managed.json"
+  CLAUDE_APART_TEST_MANAGED_SETTINGS="$T/managed.json" run claude-apart check
+  assert_rc 0 "harmless managed file" || return 1
+}
+
+test_check_fails_on_stale_hook_command() {
+  _synced || return 1
+  local f
+  for f in "$HOME/.claude-work/settings.json" "$HOME/.claude-work/.claude-apart-state.json"; do
+    perl -0pi -e 's{"command" : "[^"]*capart\.pl\x27 hook (pre-tool|prompt) [^"]*"}{"command" : "/nonexistent/hook"}g; s{"(PreToolUse|UserPromptSubmit)" : "[^"]*"}{"$1" : "/nonexistent/hook"}g' "$f"
+  done
+  grep -q /nonexistent/hook "$HOME/.claude-work/settings.json" || { echo "rewrite did not apply"; return 1; }
+  run claude-apart check
+  assert_rc 1 "check" || return 1
+  assert_contains "$OUT" "✗ work: installed PreToolUse command" "stale command named" || return 1
+}
+
+test_check_probes_work_with_a_space_in_a_root() {
+  t_two_profiles
+  sed -i.bak "s|^dir = ~/.claude-work|dir = ~/my work dir|" "$XDG_CONFIG_HOME/claude-apart/config"
+  mkdir -p "$HOME/my work dir"
+  t_login_as "$HOME/my work dir/.claude.json" w@example.com org-w
+  run claude-apart sync
+  assert_rc 0 "sync" || return 1
+  run claude-apart check
+  assert_rc 0 "check" || return 1
+  assert_not_contains "$OUT" "✗" "no failure" || return 1
+  assert_contains "$OUT" "✓ personal: read probes blocked" "personal reads the spaced root" || return 1
+}
+
+test_check_single_profile_clean_stderr() {
+  t_two_profiles
+  perl -0pi -e 's/\[profile work\].*\z//s; s/default = work/default = personal/; s/can_read = work\n//' "$XDG_CONFIG_HOME/claude-apart/config"
+  run claude-apart sync
+  assert_rc 0 "sync" || return 1
+  run claude-apart check
+  assert_rc 0 "check" || return 1
+  assert_eq "" "$ERR" "no stderr" || return 1
+}
