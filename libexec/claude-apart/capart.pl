@@ -55,9 +55,12 @@ sub cmd_config {
     return usage() unless defined $sub;
     my $path = ClaudeApart::Config::config_path();
     if ($sub eq 'add-profile') {
-        return usage() unless @a == 1;
+        return usage() unless @a >= 1;
+        my ($name, @kv) = @a;
+        my %f;
+        for my $kv (@kv) { $kv =~ /\A(\w+)=(.*)\z/s or return usage(); $f{$1} = $2 }
         my $cfg = -e $path ? ClaudeApart::Config::load($path) : ClaudeApart::Config::empty();
-        ClaudeApart::Config::add_profile($cfg, $a[0]);
+        ClaudeApart::Config::add_profile($cfg, $name, %f);
         ClaudeApart::Config::save($cfg, $path);
         return 0;
     }
@@ -238,6 +241,65 @@ sub cmd_new {
     return 0;
 }
 
+# identity-read <name>: the account the profile is logged in to: email, org
+# uuid and org name, one per line. rc 3 when there is none.
+sub cmd_identity_read {
+    my (@a) = @_;
+    return usage() unless @a == 1;
+    my $id = ClaudeApart::Identity::read($a[0]);
+    return 3 unless $id;
+    print "$id->{email}\n$id->{org}\n$id->{org_name}\n";
+    return 0;
+}
+
+# identity-dup <name> <email> <org>: prints the name of ANOTHER profile whose
+# recorded identity (email and org) is this one; rc 0 when found, 1 if not.
+sub cmd_identity_dup {
+    my (@a) = @_;
+    return usage() unless @a == 3;
+    my ($name, $email, $org) = @a;
+    my $cfg = ClaudeApart::Config::load(ClaudeApart::Config::config_path());
+    for my $n (ClaudeApart::Config::profile_names($cfg)) {
+        next if $n eq $name;
+        my $p = ClaudeApart::Config::profile($cfg, $n);
+        next unless length $p->{email} && length $p->{org};
+        if (lc $p->{email} eq lc $email && $p->{org} eq $org) { print "$n\n"; return 0 }
+    }
+    return 1;
+}
+
+# status: one line per profile. Inside a session only the session's own profile.
+sub cmd_status {
+    my (@a) = @_;
+    return usage() if @a;
+    my $cfg = ClaudeApart::Config::load(ClaudeApart::Config::config_path());
+    my @names = ClaudeApart::Config::profile_names($cfg);
+    if (($ENV{CLAUDE_CODE_CHILD_SESSION} || "") eq "1") {
+        my $own = session_profile($cfg);
+        unless (defined $own) { print STDERR "claude-apart: cannot tell which profile this session uses.\n"; return 6 }
+        @names = ($own);
+    }
+    for my $n (@names) {
+        my $p = ClaudeApart::Config::profile($cfg, $n);
+        my $id = ClaudeApart::Identity::read($n);
+        my $st = "$p->{abs_dir}/.claude-apart-state.json";
+        my $guard = 0;
+        if (open my $fh, "<", $st) {
+            local $/;
+            require JSON::PP;
+            my $d = eval { JSON::PP->new->utf8->decode(scalar <$fh>) };
+            $guard = 1 if ref $d eq "HASH" && ref $d->{hooks} eq "HASH" && defined $d->{hooks}{PreToolUse};
+        }
+        printf "%s %s %s  %s  %s  %s  %s  guard:%s\n",
+            length $p->{emoji} ? $p->{emoji} : "-", $p->{tag}, $n, $p->{dir},
+            length $p->{email} ? $p->{email} : "-",
+            $id ? $id->{email} : "not logged in",
+            @{ $p->{can_read} } ? join(",", @{ $p->{can_read} }) : "-",
+            $guard ? "yes" : "no";
+    }
+    return 0;
+}
+
 my $cmd = shift @ARGV;
 unless (defined $cmd) { exit usage() }
 if ($cmd eq 'hook') {
@@ -252,8 +314,10 @@ if ($cmd eq 'config') {
     if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
     exit $rc;
 }
-if ($cmd eq "resolve" || $cmd eq "identity-check") {
-    $rc = eval { $cmd eq "resolve" ? cmd_resolve(@ARGV) : cmd_identity_check(@ARGV) };
+if ($cmd =~ /\A(?:resolve|identity-check|identity-read|identity-dup|status)\z/) {
+    my %h = (resolve => \&cmd_resolve, "identity-check" => \&cmd_identity_check, "identity-read" => \&cmd_identity_read,
+             "identity-dup" => \&cmd_identity_dup, status => \&cmd_status);
+    $rc = eval { $h{$cmd}->(@ARGV) };
     if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
     exit $rc;
 }

@@ -6,6 +6,8 @@ usage() {
   cat <<'USAGE'
 Usage: claude-apart <command>
 
+  setup | add <name> | remove <name> | login <name> | status | sync | check | new <name>
+
 Run several Claude Code accounts side by side.
 Run claude-apart help for this text.
 USAGE
@@ -24,6 +26,10 @@ case "${1:-}" in
   sync) . "$CA_ROOT/libexec/claude-apart/cmd/sync.sh"; ca_sync; exit $? ;;
   check) . "$CA_ROOT/libexec/claude-apart/cmd/check.sh"; shift; ca_check "$@"; exit $? ;;
   new) . "$CA_ROOT/libexec/claude-apart/cmd/new.sh"; shift; ca_new "$@"; exit $? ;;
+  login|add|remove|setup|status)
+    c=$1; shift
+    . "$CA_ROOT/libexec/claude-apart/cmd/$c.sh"
+    "ca_$c" "$@"; exit $? ;;
 esac
 
 case "${1:-}" in

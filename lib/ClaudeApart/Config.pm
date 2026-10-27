@@ -210,13 +210,17 @@ sub set_profile {
 }
 
 sub add_profile {
-    my ($cfg, $name) = @_;
+    my ($cfg, $name, %f) = @_;
     _check_name($name);
     die "profile '$name' already exists\n" if $cfg->{profiles}{$name};
     my $tag = uc $name;
     $tag =~ s/-//g;
     $tag = substr($tag, 0, 6);
     $cfg->{profiles}{$name} = { dir => "~/.claude-$name", tag => $tag };
+    for my $k (sort keys %f) {
+        die "unknown key '$k'\n" unless $FIELD{$k};
+        $cfg->{profiles}{$name}{$k} = $f{$k};
+    }
     push @{ $cfg->{order} }, $name;
     validate($cfg);
 }

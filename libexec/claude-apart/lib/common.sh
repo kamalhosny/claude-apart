@@ -10,19 +10,41 @@ capart() { perl -I"$CA_ROOT/lib" "$CA_ROOT/libexec/claude-apart/capart.pl" "$@";
 
 die() { echo "claude-apart: $*" >&2; exit 1; }
 
-ask() { # <prompt> <default>
+# CA_EOF becomes 1 when a prompt hits end of input with nothing read, so a
+# guided run can stop instead of looping on answers that never come.
+CA_EOF=0
+
+ask_to() { # <var> <prompt> <default>: sets <var> in this shell (no subshell)
   local reply
-  printf '%s [%s] ' "$1" "$2" >&2
-  IFS= read -r reply || reply=
-  printf '%s\n' "${reply:-$2}"
+  printf '%s [%s] ' "$2" "$3" >&2
+  if ! IFS= read -r reply && [ -z "$reply" ]; then CA_EOF=1; fi
+  printf -v "$1" '%s' "${reply:-$3}"
 }
 
-ask_yn() { # <prompt>; default no
-  local reply
-  printf '%s [y/N] ' "$1" >&2
-  IFS= read -r reply || reply=
+ask() { # <prompt> <default>
+  local v
+  ask_to v "$1" "$2"
+  printf '%s\n' "$v"
+}
+
+ask_yn() { # <prompt> [y|n]; default no
+  local reply def=n hint='y/N'
+  [ "${2:-}" = y ] && { def=y; hint='Y/n'; }
+  printf '%s [%s] ' "$1" "$hint" >&2
+  if ! IFS= read -r reply && [ -z "$reply" ]; then CA_EOF=1; return 1; fi   # EOF means no, whatever the default
+  [ -n "$reply" ] || reply=$def
   case "$reply" in y|Y|yes|YES|Yes) return 0;; *) return 1;; esac
 }
+
+# One value of a profile from the config: ca_profile_var <profile> <NAME|DIR|ADOPTED|TAG|EMOJI|COLOUR|EMAIL|ORG|CAN_READ>.
+ca_profile_var() {
+  local CA_NAME CA_DIR CA_ADOPTED CA_TAG CA_EMOJI CA_COLOUR CA_EMAIL CA_ORG CA_CAN_READ CA_THEME CA_TMPDIR s
+  s=$(capart config shell "$1") || return 1
+  eval "$s"
+  eval "printf '%s\n' \"\$CA_$2\""
+}
+
+ca_err() { echo "claude-apart: $*" >&2; }
 
 # Path of the wrapper that every launcher link points to.
 ca_wrapper() { echo "$CA_ROOT/libexec/claude-apart/wrapper.sh"; }
