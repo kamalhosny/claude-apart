@@ -24,7 +24,7 @@ _ca_rc_unmark() { # <file>
 
 ca_uninstall() {
   local purge=0 rc=0 names n rcf cfgdir state l t
-  local here home
+  local rmfail
   while [ $# -gt 0 ]; do
     case "$1" in
       --purge) purge=1 ;;
@@ -33,11 +33,10 @@ ca_uninstall() {
     shift
   done
 
-  # never take apart a clone that is used as the install folder
-  here=$(cd "$CA_ROOT" && pwd -P)
-  home=$(cd "$CA_HOME" 2>/dev/null && pwd -P)
-  if [ "$here" = "$home" ] && [ -f "$CA_ROOT/install.sh" ]; then
-    ca_err "the install folder is the folder this code runs from (a clone); nothing was removed."
+  # R74: never take apart a clone used as the install folder (whichever copy
+  # runs this). An installed copy never has install.sh; a clone always does.
+  if [ -f "$CA_HOME/install.sh" ]; then
+    ca_err "the install folder $CA_HOME has install.sh, so it is a clone, not an installed copy; nothing was removed."
     return 1
   fi
 
@@ -83,12 +82,16 @@ ca_uninstall() {
     rm -f "$CA_HOME/bin/claude-apart"
     rmdir "$CA_HOME/bin" 2>/dev/null
   fi
-  rm -rf "$CA_HOME/libexec" "$CA_HOME/lib"
+  # R67 (5): a delete that fails is an error, not a silent leftover
+  rmfail=0
+  for t in "$CA_HOME/libexec" "$CA_HOME/lib"; do
+    rm -rf "$t" || { ca_err "could not delete $t."; rmfail=1; rc=1; }
+  done
   rmdir "$CA_HOME" 2>/dev/null
-  if [ -e "$CA_HOME" ]; then
-    echo "Kept $CA_HOME: it holds files claude-apart did not make."
-  else
+  if [ ! -e "$CA_HOME" ]; then
     echo "Removed $CA_HOME"
+  elif [ "$rmfail" = 0 ]; then
+    echo "Kept $CA_HOME: it holds files claude-apart did not make."
   fi
 
   # 4. optional: config and temp folders
@@ -97,13 +100,14 @@ ca_uninstall() {
     case "${XDG_STATE_HOME:-}" in /*) state=$XDG_STATE_HOME ;; *) state=$HOME/.local/state ;; esac
     state=$state/claude-apart
     if [ -d "$cfgdir" ] && ask_yn "Delete the claude-apart config folder $cfgdir?"; then
-      rm -rf "$cfgdir" && echo "Deleted $cfgdir"
+      if rm -rf "$cfgdir"; then echo "Deleted $cfgdir"; else ca_err "could not delete $cfgdir."; rc=1; fi
     fi
     if [ -d "$state" ] && ask_yn "Delete the per-profile temp folders in $state?"; then
-      rm -rf "$state" && echo "Deleted $state"
+      if rm -rf "$state"; then echo "Deleted $state"; else ca_err "could not delete $state."; rc=1; fi
     fi
   fi
 
   echo "Profile folders and logins were not touched."
+  echo "Restart every open Claude session; open sessions still point at the removed copy."
   return "$rc"
 }

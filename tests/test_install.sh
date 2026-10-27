@@ -98,13 +98,13 @@ test_uninstall_restores() {
 test_uninstall_purge_asks_first() {
   t_two_profiles
   run "$REPO/install.sh"; assert_rc 0 "install" || return 1
-  mkdir -p "$HOME/.local/state/claude-apart/tmp/work"
+  mkdir -p "$XDG_STATE_HOME/claude-apart/tmp/work"
   run bash -c "printf 'n\nn\n' | '$T/prefix/bin/claude-apart' uninstall --purge"; assert_rc 0 "purge, answers no" || return 1
-  [ -d "$XDG_CONFIG_HOME/claude-apart" ] && [ -d "$HOME/.local/state/claude-apart" ] || { echo "removed despite no"; return 1; }
+  [ -d "$XDG_CONFIG_HOME/claude-apart" ] && [ -d "$XDG_STATE_HOME/claude-apart" ] || { echo "removed despite no"; return 1; }
   run "$REPO/install.sh"; assert_rc 0 "install again" || return 1
   run bash -c "printf 'y\ny\n' | '$T/prefix/bin/claude-apart' uninstall --purge"; assert_rc 0 "purge, answers yes" || return 1
   [ ! -e "$XDG_CONFIG_HOME/claude-apart" ] || { echo "config left"; return 1; }
-  [ ! -e "$HOME/.local/state/claude-apart" ] || { echo "temp folders left"; return 1; }
+  [ ! -e "$XDG_STATE_HOME/claude-apart" ] || { echo "temp folders left"; return 1; }
   [ -d "$HOME/.claude-work" ] && [ -f "$HOME/.claude-work/.claude.json" ] || { echo "profile lost"; return 1; }
 }
 
@@ -196,4 +196,50 @@ test_rc_files_without_final_newline_round_trip() {
   run "$REPO/install.sh"; assert_rc 0 "install 2" || return 1
   run "$T/prefix/bin/claude-apart" uninstall; assert_rc 0 "uninstall 2" || return 1
   assert_eq "alias a=b" "$(cat "$HOME/.bashrc")" "last-line case" || return 1
+}
+
+test_uninstall_refuses_any_clone_as_home() { # R74: a clone used as CA_HOME, run from another copy
+  mkdir "$T/clone" && cp -R "$REPO/bin" "$REPO/lib" "$REPO/libexec" "$REPO/install.sh" "$T/clone/"   # a copy, never the real repo
+  CLAUDE_APART_HOME="$T/clone" run "$REPO/bin/claude-apart" uninstall
+  assert_rc 1 "refused" || return 1
+  assert_contains "$ERR" "has install.sh" "says why" || return 1
+  [ -d "$T/clone/lib/ClaudeApart" ] && [ -d "$T/clone/libexec/claude-apart" ] || { echo "clone damaged"; return 1; }
+}
+
+test_uninstall_failed_delete_is_an_error() { # R67 (5)
+  t_two_profiles
+  run "$REPO/install.sh"; assert_rc 0 "install" || return 1
+  chmod 555 "$T/prefix/lib/ClaudeApart"
+  run "$T/prefix/bin/claude-apart" uninstall
+  chmod 755 "$T/prefix/lib/ClaudeApart"
+  assert_rc 1 "failed delete" || return 1
+  assert_contains "$ERR" "could not delete $T/prefix/lib." "message" || return 1
+  assert_not_contains "$OUT" "Kept $T/prefix: it holds files" "no misleading kept line" || return 1
+}
+
+test_uninstall_says_restart_sessions() { # F21
+  t_two_profiles
+  run "$REPO/install.sh"; assert_rc 0 "install" || return 1
+  run "$T/prefix/bin/claude-apart" uninstall; assert_rc 0 "uninstall" || return 1
+  assert_contains "$OUT" "Restart every open Claude session; open sessions still point at the removed copy." "restart line" || return 1
+}
+
+test_reinstall_after_uninstall_makes_launchers() { # F13: sync makes the launchers again
+  t_two_profiles
+  run "$REPO/install.sh"; assert_rc 0 "install" || return 1
+  run "$T/prefix/bin/claude-apart" sync; assert_rc 0 "sync" || return 1
+  [ -L "$T/prefix/bin/claude-work" ] || { echo "no claude-work after first sync"; return 1; }
+  run "$T/prefix/bin/claude-apart" uninstall; assert_rc 0 "uninstall" || return 1
+  [ -f "$XDG_CONFIG_HOME/claude-apart/config" ] || { echo "config gone"; return 1; }
+  run "$REPO/install.sh"; assert_rc 0 "install again" || return 1
+  [ -L "$T/prefix/bin/claude-work" ] || { echo "claude-work link missing after reinstall"; ls -la "$T/prefix/bin"; return 1; }
+  [ -L "$T/prefix/bin/claude" ] && [ -L "$T/prefix/bin/claude-personal" ] || { echo "other links missing"; return 1; }
+  assert_eq "$T/prefix/libexec/claude-apart/wrapper.sh" "$(readlink "$T/prefix/bin/claude-work")" "points at the wrapper" || return 1
+}
+
+test_sync_says_restart_sessions() { # F20
+  t_two_profiles
+  run claude-apart sync; assert_rc 0 "sync" || return 1
+  assert_contains "$OUT" "Restart every open Claude session (and Herdr agents) so they load the guard." "restart line" || return 1
+  assert_eq 1 "$(printf '%s\n' "$OUT" | grep -c 'Restart every open')" "once" || return 1
 }

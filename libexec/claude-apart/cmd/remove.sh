@@ -85,7 +85,11 @@ ca_remove() {
   if [ "$delete" = 1 ] && [ "$prc" = 0 ]; then
     # checked again right before the delete, and the checked path is deleted
     if _ca_dir_deletable "$name" "$dir"; then
-      [ -z "$CA_REAL" ] || { rm -rf -- "$CA_REAL" && echo "Deleted $dir."; }
+      if [ -n "$CA_REAL" ]; then
+        if rm -rf -- "$CA_REAL"; then echo "Deleted $dir."
+        else ca_err "could not delete $dir."; rc=1
+        fi
+      fi
     else
       ca_err "the profile is removed, but the folder $dir was kept (it failed the safety check)."
       rc=1

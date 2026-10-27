@@ -97,7 +97,7 @@ ca_add() {
   fi
   [ -n "$(capart config default)" ] || capart config set default "$name"
   _ca_sh sync
-  if ! { install_links && ca_sync; }; then
+  if ! ca_sync; then
     ca_err "profile $name was added, but the sync failed; run: claude-apart sync"
     return 3
   fi

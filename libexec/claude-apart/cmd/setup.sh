@@ -43,7 +43,7 @@ _ca_add_say() {
   esac
 }
 
-_ca_resync() { install_links && ca_sync; }
+_ca_resync() { ca_sync; }    # ca_sync makes the launchers too (F13)
 
 _ca_choose_default() {
   local names cur d
@@ -77,9 +77,9 @@ _ca_setup_menu() {
         ask_to n "Profile to remove" ""
         _ca_eof_stop || return 1
         [ -z "$n" ] || ca_remove "$n" || echo "Profile not removed." ;;
-      grants) _ca_grants || return 1; _ca_resync ;;
+      grants) _ca_grants || return 1; _ca_resync; ca_restart_note ;;
       default) _ca_choose_default || return 1 ;;
-      sync) _ca_resync ;;
+      sync) _ca_resync; ca_restart_note ;;
       done|"") return 0 ;;
       *) echo "Not a choice: $c" ;;
     esac
@@ -124,7 +124,10 @@ ca_setup() {
   _ca_choose_default || return 1
   _ca_grants || return 1
 
-  # 6. launchers, 7. settings, 8. self-check
+  # 6. launchers, 7. settings, 8. self-check, 9. open sessions
   _ca_resync || return 1
   ca_check
+  n=$?
+  ca_restart_note
+  return "$n"
 }

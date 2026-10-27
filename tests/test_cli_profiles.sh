@@ -111,6 +111,9 @@ test_setup_fresh_two_profiles() {
   assert_eq "$REPO/libexec/claude-apart/wrapper.sh" "$(readlink "$CLAUDE_APART_HOME/bin/claude-work")" "links to wrapper" || return 1
   assert_contains "$OUT" "✓ work:" "check ran" || return 1
   assert_not_contains "$OUT" "✗" "check passed" || return 1
+  # F20: the last step says to restart open sessions, once
+  assert_eq "Restart every open Claude session (and Herdr agents) so they load the guard." "$(printf '%s\n' "$OUT" | tail -n 1)" "restart line last" || return 1
+  assert_eq 1 "$(printf '%s\n' "$OUT" | grep -c 'Restart every open')" "restart line once" || return 1
 }
 
 test_setup_fresh_eof_exits_1() {
@@ -433,6 +436,19 @@ test_remove_delete_dir_asks_and_deletes() {
   [ -d "$HOME" ] || return 1
 }
 
+test_remove_delete_dir_failed_rm_says_so() { # R67 (5): a failed delete is an error
+  t_two_profiles
+  capart config set default personal
+  mkdir -p "$HOME/.claude-work/locked/sub"
+  : > "$HOME/.claude-work/locked/sub/f"
+  chmod 555 "$HOME/.claude-work/locked/sub"
+  run bash -c "printf 'y\n' | claude-apart remove work --delete-dir"
+  chmod 755 "$HOME/.claude-work/locked/sub"
+  [ "$RC" != 0 ] || { echo "expected failure"; return 1; }
+  assert_contains "$ERR" "could not delete $HOME/.claude-work." "message" || return 1
+  assert_not_contains "$OUT" "Deleted $HOME/.claude-work." "no success line" || return 1
+}
+
 test_remove_delete_dir_missing_dir_says_so() {
   t_two_profiles
   capart config set default personal
@@ -486,6 +502,20 @@ test_remove_delete_dir_refuses_overlap_with_other_profile() {
   assert_contains "$ERR" "overlaps the folder of profile lab" "message" || return 1
   [ -d "$HOME/.claude-work/sub" ] || { echo "nested dir deleted"; return 1; }
   assert_contains "$(capart config profiles)" work "nothing changed" || return 1
+}
+
+test_dir_conflict_fails_closed() { # R67 (4): an unreadable owned list or profile list refuses
+  t_two_profiles
+  local fn='. "$1"; capart() { case "$1 $2" in "$FAIL") echo "boom" >&2; return 1;; esac; perl -I"$CA_ROOT/lib" "$CA_ROOT/libexec/claude-apart/capart.pl" "$@"; }; ca_dir_conflict "$2" "" 0'
+  FAIL="config owned" run bash -c "$fn" _ "$REPO/libexec/claude-apart/lib/common.sh" "$HOME/newdir"
+  assert_rc 1 "owned failure refuses" || return 1
+  FAIL="config profiles" run bash -c "$fn" _ "$REPO/libexec/claude-apart/lib/common.sh" "$HOME/newdir"
+  assert_rc 1 "profiles failure refuses" || return 1
+  FAIL="none" run bash -c "$fn" _ "$REPO/libexec/claude-apart/lib/common.sh" "$HOME/newdir"
+  assert_rc 0 "a free folder still passes" || return 1
+  rm -f "$XDG_CONFIG_HOME/claude-apart/config"
+  FAIL="config profiles" run bash -c "$fn" _ "$REPO/libexec/claude-apart/lib/common.sh" "$HOME/newdir"
+  assert_rc 0 "no config file yet: nothing to overlap" || return 1
 }
 
 # Probe 1: a ".." behind a symlink. The check and the delete must see one folder.
@@ -628,7 +658,7 @@ test_login_uses_profile_temp_folder() {
   _work_unlogged || return 1
   export FAKE_LOGIN_EMAIL=w2@example.com FAKE_LOGIN_ORG=org-w2
   run bash -c "printf 'y\n' | claude-apart login work"
-  local tmp="$HOME/.local/state/claude-apart/tmp/work"
+  local tmp="$XDG_STATE_HOME/claude-apart/tmp/work"
   assert_contains "$(cat "$FAKE_LOG")" "TMPDIR_CC=$tmp" "CLAUDE_CODE_TMPDIR set" || return 1
   assert_eq 700 "$(perl -e 'printf "%o", (stat shift)[2] & 0777' "$tmp")" "mode" || return 1
 }
@@ -677,7 +707,7 @@ test_add_refuses_owned_path_overlaps() {
   capart config set-profile personal protect "$HOME/notes/private" || return 1
   _add_refused n --dir "$HOME/notes" || return 1
   _add_refused n --dir "$HOME/.claude.json.d" || return 1
-  _add_refused n --dir "$HOME/.local/state/claude-apart/tmp/personal" || return 1
+  _add_refused n --dir "$XDG_STATE_HOME/claude-apart/tmp/personal" || return 1
 }
 
 test_remove_delete_dir_refuses_other_profiles_protect_path() {
@@ -736,15 +766,43 @@ test_session_identity_check_only_own() {
   assert_rc 0 "own" || return 1
 }
 
+test_session_statusline_only_own() { # R67 (1): statusline --profile follows R63 too
+  t_two_profiles
+  _in_work_session capart statusline --profile personal </dev/null
+  [ "$RC" != 0 ] || { echo "expected refusal"; return 1; }
+  assert_not_contains "$OUT$ERR" "p@example.com" "no other email" || return 1
+  _in_work_session capart statusline --profile work </dev/null
+  assert_rc 0 "own" || return 1
+  assert_contains "$OUT" "w@example.com" "own status line" || return 1
+  run capart statusline --profile personal </dev/null
+  assert_rc 0 "outside a session any profile" || return 1
+}
+
 test_guard_blocks_running_capart() {
   t_two_profiles
-  local c cap="$REPO/libexec/claude-apart/capart.pl"
+  # R67 (6): a copy outside the repo (the repo is the tool root, where R26 alone would block)
+  local c cap="$HOME/elsewhere/libexec/claude-apart/capart.pl" cwd="$HOME/proj"
+  mkdir -p "$cwd" "${cap%/*}"
   for c in "perl ~/x/libexec/claude-apart/capart.pl config set-fields work.can_read=personal" \
            "xargs perl $cap config set-fields a.b=c" "$cap config set default work" \
            "cd /tmp && ./capart.pl status" "env perl -I lib $cap status" "bash $cap" \
-           "find . -exec perl $cap status ;" "echo x | xargs $cap" "FOO=1 perl $cap status"; do
-    pre_tool work Bash "{\"command\":$(_json_str "$c")}"
+           "find . -exec perl $cap status ;" "echo x | xargs $cap" "FOO=1 perl $cap status" \
+           "perl -n $cap" "perl -p $cap" "perl -Mautodie $cap" "perl -ie 1 $cap" "python3 x.py $cap" \
+           "ruby -E utf-8 $cap" "node --inspect $cap" "perl -e 1 perl $cap"; do
+    pre_tool work Bash "{\"command\":$(_json_str "$c")}" "$cwd"
     assert_rc 2 "blocked: $c" || return 1
+  done
+}
+
+test_guard_capart_as_data_after_program_option() { # R67 (2) as corrected
+  t_two_profiles
+  local c cap="$HOME/elsewhere/libexec/claude-apart/capart.pl" cwd="$HOME/proj"
+  mkdir -p "$cwd" "${cap%/*}"
+  for c in "perl -ne 'print if /session/' $cap" "perl -lne 'print' $cap" "perl -E 'say 1' $cap" \
+           "ruby -e 'puts ARGF.read.size' $cap" "node -e 'console.log(1)' $cap" \
+           "python3 -c 'import sys; print(sys.argv)' $cap" "bash -c 'wc -l \"\$0\"' $cap" "sh -ec true $cap"; do
+    pre_tool work Bash "{\"command\":$(_json_str "$c")}" "$cwd"
+    assert_rc 0 "allowed: $c" || return 1
   done
 }
 
