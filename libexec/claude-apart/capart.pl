@@ -389,6 +389,19 @@ sub cmd_canon {
     return 0;
 }
 
+# copy-items <from> <to>: the items that could be copied, as TSV. copy-apply <from> <to> <kind> <id>:
+# copies one. Both change or read another profile, so never inside a session (R63, R65, R68).
+sub cmd_copy {
+    my ($sub, @a) = @_;
+    if (in_session()) { print STDERR "claude-apart: copy cannot run inside Claude.\n"; return 1 }
+    return usage() unless ($sub eq "copy-items" && @a == 2) || ($sub eq "copy-apply" && @a == 4);
+    require ClaudeApart::Copy;
+    my $cfg = ClaudeApart::Config::load(ClaudeApart::Config::config_path());
+    if ($sub eq "copy-items") { print ClaudeApart::Copy::list_tsv($cfg, @a) }
+    else { print ClaudeApart::Copy::apply($cfg, @a), "\n" }
+    return 0;
+}
+
 my $cmd = shift @ARGV;
 unless (defined $cmd) { exit usage() }
 if ($cmd eq 'hook') {
@@ -426,6 +439,11 @@ if ($cmd eq "new" || $cmd eq "check") {
             ClaudeApart::Check::run($base);
         }
     };
+    if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
+    exit $rc;
+}
+if ($cmd eq "copy-items" || $cmd eq "copy-apply") {
+    $rc = eval { cmd_copy($cmd, @ARGV) };
     if ($@) { my $e = $@; $e =~ s/ at \S+ line \d+\.?\n?\z//; chomp $e; print STDERR "claude-apart: $e\n"; exit 1 }
     exit $rc;
 }

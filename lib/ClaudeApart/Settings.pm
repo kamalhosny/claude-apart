@@ -2,6 +2,7 @@ package ClaudeApart::Settings;
 use strict;
 use warnings;
 use Cwd qw(abs_path);
+use Fcntl ();
 use File::Basename qw(dirname basename);
 use JSON::PP ();
 use ClaudeApart::Config;
@@ -59,7 +60,8 @@ sub _read_json {
 sub _write_atomic {
     my ($file, $bytes, $mode) = @_;
     my $tmp = "$file.tmp.$$";
-    open my $fh, '>', $tmp or die "cannot write $tmp: $!\n";
+    # O_EXCL: never write into a file or link that is already there
+    sysopen(my $fh, $tmp, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_EXCL(), 0600) or die "cannot write $tmp: $!\n";
     if (defined $mode) { chmod $mode, $tmp or do { unlink $tmp; die "cannot chmod $tmp: $!\n" } }
     print $fh $bytes or do { unlink $tmp; die "write failed: $!\n" };
     close $fh or do { unlink $tmp; die "write failed: $!\n" };
@@ -267,6 +269,23 @@ sub _undo {
     if ($st && exists $st->{theme_set} && defined $d->{theme} && $d->{theme} eq $st->{theme_set}) {
         if (exists $st->{theme_original}) { $d->{theme} = $st->{theme_original} } else { delete $d->{theme} }
     }
+}
+
+# Guarded read-modify-write for `copy`: $cb->($settings, $state_or_undef) edits
+# both in place. The same checks as install (no symlinks, nothing outside the
+# profile folder, bad JSON stops us). The state file is written first, then
+# settings, and only the file that changed.
+sub modify {
+    my ($cfg, $name, $cb) = @_;
+    my ($p, $file, $sfile) = _paths($cfg, $name);
+    my $d = -e $file ? _read_json($file, 'settings.json') : {};
+    my $st = -e $sfile ? _read_state($sfile) : undef;
+    _check_types($d, $file);
+    my ($b, $sb) = (_json()->encode($d), $st ? _json()->encode($st) : '');
+    $cb->($d, $st);
+    _write_json($sfile, $st, 1) if $st && _json()->encode($st) ne $sb;
+    _write_json($file, $d) if _json()->encode($d) ne $b;
+    return 1;
 }
 
 sub uninstall {
