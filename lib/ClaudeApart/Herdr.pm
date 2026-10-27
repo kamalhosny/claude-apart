@@ -6,6 +6,10 @@ use ClaudeApart::Config;
 use ClaudeApart::Proc;
 
 my $TIMEOUT = 3;           # seconds for one herdr call
+# Absolute time (Time::HiRes) by which all herdr calls must be done, or undef.
+# session-start sets it: each call then gets only the time left, and no call
+# starts when too little is left.
+our $DEADLINE;
 my $MAX_OUT = 1 << 20;     # more output than this is a failure
 
 my $WS   = qr/w[A-Za-z0-9]+/;           # workspace id: w1, wG
@@ -44,7 +48,14 @@ sub _herdr_json {
 
 sub _run_herdr {
     my (@args) = @_;
-    return ClaudeApart::Proc::capture({ timeout => $TIMEOUT, max => $MAX_OUT }, "herdr", @args);
+    my $timeout = $TIMEOUT;
+    if (defined $DEADLINE) {
+        require Time::HiRes;
+        my $left = $DEADLINE - Time::HiRes::time();
+        return undef if $left < 0.1;
+        $timeout = $left if $left < $timeout;
+    }
+    return ClaudeApart::Proc::capture({ timeout => $timeout, max => $MAX_OUT }, "herdr", @args);
 }
 
 # A workspace's label ('' when it has none), or undef when the lookup fails

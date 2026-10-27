@@ -39,6 +39,8 @@ sub capture {
         exec { $cmd[0] } @cmd or POSIX::_exit(127);
     }
     setpgrp($pid, $pid) if $opt->{group};    # both sides, so a kill never races
+    # A group command must not outlive us: on TERM, INT or HUP kill its group.
+    local @SIG{qw(TERM INT HUP)} = (sub { kill('KILL', -$pid); POSIX::_exit(143) }) x 3 if $opt->{group};
     close $w;
     my $deadline = Time::HiRes::time() + $timeout;
     my ($out, $eof, $status) = ('', 0, undef);

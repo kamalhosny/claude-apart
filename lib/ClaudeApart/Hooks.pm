@@ -10,7 +10,8 @@ use ClaudeApart::Herdr;
 # Entry points for `capart.pl hook <event> --profile NAME`.
 # Exit 2 blocks (Claude Code treats every other code as allow), so every
 # failure becomes exit 2 with the fixed guard error text. Block messages are
-# fixed text: never a path, a profile name or an email. The time budget is
+# fixed text: never a path, another profile's name or an email (the identity
+# text holds the own profile name). The time budget is
 # enforced by the supervisor process in capart.pl.
 
 our $BLOCK_TEXT = "claude-apart: blocked \xe2\x80\x94 this touches another profile.";
@@ -142,9 +143,10 @@ sub herdr_labels {
     return () unless ($ENV{HERDR_ENV} || '') eq '1' && length $p->{emoji} && length $p->{tag};
     require Time::HiRes;
     my $t0 = Time::HiRes::time();
-    # The supervisor kills at 5 s and each herdr call may take 3: do not start another late.
-    my $late = sub { Time::HiRes::time() - $t0 > 1.5 };
+    # The supervisor kills at 5 s: all herdr work shares one deadline.
+    local $ClaudeApart::Herdr::DEADLINE = $t0 + 3.5;
     my @msgs;
+    my $other = 0;    # R56: another profile's workspace: no tab rename
     my $ws = $ENV{HERDR_WORKSPACE_ID};
     if (defined $ws && length $ws) {
         my $label = ClaudeApart::Herdr::workspace_label($ws);
@@ -154,14 +156,15 @@ sub herdr_labels {
                 my $head = "$p->{emoji} $p->{tag}";
                 ClaudeApart::Herdr::rename_workspace($ws, length $label ? "$head \xc2\xb7 $label" : $head);
             } elsif ($owner ne $profile) {
+                $other = 1;
                 push @msgs, 'claude-apart: this Herdr workspace belongs to another profile.';
             }
         }
     }
     my $tab = $ENV{HERDR_TAB_ID};
-    if (defined $tab && length $tab && !$late->()) {
+    if (defined $tab && length $tab && !$other) {
         my $label = ClaudeApart::Herdr::tab_label($tab);
-        if (defined $label && index($label, "$p->{emoji} ") != 0) {
+        if (defined $label && $label !~ /\A\Q$p->{emoji}\E(?: |\z)/) {
             ClaudeApart::Herdr::rename_tab($tab, length $label ? "$p->{emoji} $label" : $p->{emoji});
         }
     }
