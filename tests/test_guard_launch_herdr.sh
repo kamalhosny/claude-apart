@@ -108,14 +108,14 @@ test_copy_blocked_in_session() {
   _blocks personal 'claude-apart copy personal work' || return 1
 }
 
-test_claude_apart_allowlist() { # R42: a known subcommand outside the allowlist, or no next word, or an option
+test_claude_apart_allowlist() { # R42: a known subcommand outside the allowlist, or an option
   t_two_profiles
   _allows work 'claude-apart status' 'claude-apart check' 'claude-apart help' 'claude-apart -h' \
     'claude-apart --help' 'claude-apart new work ideas' 'claude-apart new work --cwd /tmp' \
     'which claude-apart' 'command -v claude-apart' 'type claude-apart' \
     'git add bin/claude-apart README.md' 'git add bin/claude-apart lib/x tests/y.sh' \
-    'shellcheck bin/claude-apart libexec/claude-apart/wrapper.sh' 'claude-apart frobnicate' || return 1
-  _blocks work 'claude-apart' 'claude-apart --version' 'xargs claude-apart' 'echo sync | xargs claude-apart' \
+    'shellcheck bin/claude-apart libexec/claude-apart/wrapper.sh' 'claude-apart frobnicate' 'claude-apart' || return 1
+  _blocks work 'claude-apart --version' 'xargs claude-apart' 'echo sync | xargs claude-apart' \
     'claude-apart new personal ideas' 'claude-apart new' 'claude-apart remove personal' \
     'claude-apart sync' 'claude-apart add extra' 'claude-apart login work' 'claude-apart setup' \
     'claude-apart uninstall' 'claude-apart copy personal work' '/opt/x/bin/claude-apart sync' \
@@ -303,10 +303,31 @@ test_herdr_indirect_calls_blocked() { # R47
   _blocks work '$(command -v herdr) pane read w2:p1' 'H=$(command -v herdr); $H pane read w2:p1' \
     'CMD="pane read w2:p1"; herdr $CMD' 'echo pane read w2:p1 | xargs herdr' \
     'f() { herdr "$@"; }; f pane read w2:p1' '${HB:-herdr} pane read w2:p1' 'herdr pane "$V" w2:p1' \
-    '"$(which herdr)" agent prompt me hi' '`which herdr` pane run w1:p2 ls' 'herdr' \
+    '"$(which herdr)" agent prompt me hi' '`which herdr` pane run w1:p2 ls' \
     'find . -name x -exec herdr {} \;' 'herdr terminal session $X w1:p1' || return 1
   _allows work 'which herdr' 'command -v herdr' 'command -V herdr' 'type herdr' 'type -a herdr' \
     'ls -l "$(command -v herdr)"' || return 1
+}
+
+test_trailing_word_rule() { # R49: a last claude-apart/herdr word blocks only under xargs/parallel; after find -exec always
+  t_two_profiles
+  _herdr_std
+  _allows work 'cat bin/claude-apart' 'bash -n bin/claude-apart' 'git add bin/claude-apart' \
+    'ls ~/.config/herdr' 'command -v herdr' 'herdr' 'claude-apart' 'echo x | grep herdr' \
+    'echo x | xargs which herdr' 'xargs command -v claude-apart < f' 'cat x | xargs -n1 echo herdr x' || return 1
+  _blocks work 'echo pane read w2:p1 | xargs herdr' 'xargs claude-apart < f' 'parallel herdr' \
+    'echo a | /usr/bin/xargs -0 herdr' 'X=1 xargs claude-apart' 'parallel -j2 claude-apart' \
+    'claude-apart copy personal work' 'bash bin/claude-apart copy personal work' || return 1
+  # find -exec: from a folder that holds no profile, so only R49 can block
+  local d="$T/proj" c
+  mkdir -p "$d"
+  for c in 'find . -name x -exec cat {} \;' 'find . -exec ls ~/.config/herdr \;'; do
+    _run_bash work "$c" "$d"; _expect_allow "work in proj: $c" || return 1
+  done
+  for c in 'find . -name x -exec herdr {} \;' 'find . -execdir claude-apart {} \;' 'find . -ok herdr --help \;' \
+    'find . -okdir claude-apart status \;' 'find . -exec /opt/bin/herdr \;' 'find . -exec claude-apart \;'; do
+    _run_bash work "$c" "$d"; _expect_block "work in proj: $c" || return 1
+  done
 }
 
 test_herdr_terminal_and_other_groups() {

@@ -712,6 +712,24 @@ my %APART_SAFE   = map { $_ => 1 } qw(status check help -h --help);
 my %APART_CMD    = map { $_ => 1 } qw(setup add remove login status check copy new sync uninstall help);
 my $ENV_NAME     = qr/CLAUDE_CONFIG_DIR|CLAUDE_APART_PROFILE|CLAUDE_CODE_CHILD_SESSION/;
 
+my $FIND_EXEC     = qr/\A-(?:exec|execdir|ok|okdir)\z/;
+my %FEEDS_ARGS   = map { $_ => 1 } qw(xargs parallel);
+
+# R49: is the word at $k a command that gets words no one can see? Right
+# after find's -exec, -execdir, -ok or -okdir: yes, whatever follows it. As
+# the last word: only when the command (after VAR=… words) is xargs or
+# parallel, and not as the argument of which, type or command -v. Any other
+# last word is just an argument (`cat bin/claude-apart`, `ls ~/.config/herdr`).
+sub _fed_words {
+    my ($w, $k) = @_;
+    return 1 if $k > 0 && $w->[ $k - 1 ] =~ $FIND_EXEC;
+    return 0 if $k < $#$w;
+    my ($head) = grep { $_ !~ /\A[A-Za-z_][A-Za-z0-9_]*\+?=/ } @$w;
+    my $n = defined $head ? _name($head) : undef;
+    return 0 unless defined $n && $FEEDS_ARGS{$n};
+    return _lookup_only($w, $k) ? 0 : 1;
+}
+
 # Is the word at $k an argument of which, type or command -v/-V (a lookup,
 # not a run)?
 sub _lookup_only {
@@ -729,11 +747,11 @@ sub _lookup_only {
 # (claude-$p, claude-`…`, claude-{a,b}).
 # R42: `claude-apart` blocks when the next word is a known subcommand other
 # than status, check, help or `new <own profile>`; when it is an option other
-# than -h/--help, or cannot be known ($X, `…`); and when there is none
-# (xargs and -exec add words of their own), except as the argument of
-# which, type or command -v. Any other next word is a file, not a
-# subcommand (`git add bin/claude-apart README.md`). Glued after =
-# (c=claude-apart) it may run later with any words: block.
+# than -h/--help, or cannot be known ($X, `…`). Any other next word is a
+# file, not a subcommand (`git add bin/claude-apart README.md`). Glued after
+# = (c=claude-apart) it may run later with any words: block. R49: after
+# find -exec, or last under xargs/parallel, it blocks (see _fed_words); any
+# other last word passes (bare `claude-apart` prints usage).
 sub _rule_launcher {
     my ($ctx, $sh) = @_;
     my $own = $ctx->{profile};
@@ -749,8 +767,8 @@ sub _rule_launcher {
                 return 1 if $other{ lc $1 } || $1 eq '' || $1 =~ /[\$`{]/;
             }
             next unless $w[$k] =~ $CLAUDE_APART;
-            return 1 if index($w[$k], '=') >= 0;
-            if ($k == $#w) { next if _lookup_only(\@w, $k); return 1 }
+            return 1 if index($w[$k], '=') >= 0 || _fed_words(\@w, $k);
+            next if $k == $#w;
             my $sub = $w[ $k + 1 ];
             next if $APART_SAFE{$sub};
             return 1 if $sub =~ /\A-|[\$`]/;
@@ -803,11 +821,12 @@ sub _own_assignment {
 #   of the Herdr env the lookups rely on (HERDR_SOCKET=…, unset HERDR_…);
 #   $HERDR_PANE_ID and the like may be read;
 # - R47: herdr runs in the open. Blocked: herdr glued after = (h=herdr),
-#   herdr with no words after it (xargs, -exec, a function), command words
-#   that cannot be known, and a herdr read or input command after a word
-#   that cannot be known ($H pane read …, "$(which herdr)" pane read …) or
-#   at the start of a command (the rest of `$(…) pane read …`).
-#   `which herdr`, `type herdr` and `command -v herdr` stay allowed.
+#   command words that cannot be known, and a herdr read or input command
+#   after a word that cannot be known ($H pane read …, "$(which herdr)"
+#   pane read …) or at the start of a command (the rest of `$(…) pane read …`).
+# - R49: herdr after find -exec, or last under xargs/parallel, blocks (see
+#   _fed_words); any other last herdr word passes (bare `herdr` needs a
+#   terminal; `ls ~/.config/herdr`, `command -v herdr`).
 sub _rule_herdr {
     my ($ctx, $sh) = @_;
     my ($any, @calls) = (0);
@@ -822,8 +841,8 @@ sub _rule_herdr {
                 next;
             }
             $any = 1;
-            return 1 if index($w[$k], '=') >= 0;
-            if ($k == $#w) { next if _lookup_only(\@w, $k); return 1 }
+            return 1 if index($w[$k], '=') >= 0 || _fed_words(\@w, $k);
+            next if $k == $#w;
             my $c = ClaudeApart::Herdr::parse_command([ @w[ $k + 1 .. $#w ] ]);
             return 1 if $c->{kind} eq 'unknown';
             push @calls, $c;
