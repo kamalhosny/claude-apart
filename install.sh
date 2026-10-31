@@ -3,7 +3,7 @@
 # (curl -fsSL <url>/install.sh | sh). Installs into your home, no root.
 # POSIX sh on purpose, so it runs on macOS and Ubuntu.
 
-CA_DEFAULT_REPO="OWNER/claude-apart"
+CA_DEFAULT_REPO="kamalhosny/claude-apart"
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'claude-apart: %s\n' "$*" >&2; exit 1; }

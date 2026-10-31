@@ -64,8 +64,9 @@ EOF
   [ -x "$T/prefix/bin/claude-apart" ] || { echo "not installed"; return 1; }
 }
 
-test_install_default_repo_is_one_line() {
-  [ "$(grep -c 'OWNER/claude-apart' "$REPO/install.sh")" = 1 ] || { echo "OWNER must appear on exactly one line"; return 1; }
+test_install_default_repo_is_set() {
+  [ "$(grep -c '^CA_DEFAULT_REPO="kamalhosny/claude-apart"$' "$REPO/install.sh")" = 1 ] || { echo "default repo must be kamalhosny/claude-apart, on one line"; return 1; }
+  ! grep -q 'OWNER/claude-apart' "$REPO/install.sh" "$REPO/README.md" || { echo "OWNER placeholder left"; return 1; }
 }
 
 _seed_settings() {

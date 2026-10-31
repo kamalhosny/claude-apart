@@ -30,7 +30,7 @@ platform; Linux is best effort.
 From a clone:
 
 ```sh
-git clone https://github.com/OWNER/claude-apart.git
+git clone https://github.com/kamalhosny/claude-apart.git
 cd claude-apart
 ./install.sh
 ```
@@ -38,7 +38,7 @@ cd claude-apart
 Or in one line:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/claude-apart/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kamalhosny/claude-apart/main/install.sh | sh
 ```
 
 - It installs into `~/.local/share/claude-apart` (set `CLAUDE_APART_HOME` to
