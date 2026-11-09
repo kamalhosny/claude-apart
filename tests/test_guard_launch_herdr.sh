@@ -268,6 +268,16 @@ test_herdr_rename_close_are_input() {
   _blocks personal 'herdr workspace close w1' 'herdr tab rename w1:t1 x' || return 1    # a read grant is no input
 }
 
+test_herdr_letter_ids() { # herdr counts tabs and panes past 9 with letters: t9, tB, tC …
+  t_two_profiles
+  _herdr_std
+  _allows work 'herdr tab close w1:tG' 'herdr tab rename w1:tB x' 'herdr pane read w1:pC' \
+    'herdr pane run w1:pZ ls' 'herdr pane read --pane w1:pB' || return 1
+  HERDR_TAB_ID=w1:tG _allows work 'herdr tab close "$HERDR_TAB_ID"' || return 1
+  _blocks work 'herdr tab close w2:tG' 'herdr pane read w3:pB' 'herdr pane run w2:pC ls' || return 1
+  _blocks personal 'herdr tab close w1:tG' || return 1
+}
+
 test_herdr_relabel_and_move() { # a pane may not change profile by a new label, a move or a swap
   t_two_profiles
   _herdr_std

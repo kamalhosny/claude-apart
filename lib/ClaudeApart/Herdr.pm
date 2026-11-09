@@ -13,8 +13,8 @@ our $DEADLINE;
 my $MAX_OUT = 1 << 20;     # more output than this is a failure
 
 my $WS   = qr/w[A-Za-z0-9]+/;           # workspace id: w1, wG
-my $PANE = qr/\A($WS):p[0-9]+\z/;       # pane id: w1:p1
-my $TAB  = qr/\A($WS):t[0-9]+\z/;       # tab id: w1:t1
+my $PANE = qr/\A($WS):p[A-Za-z0-9]+\z/;  # pane id: w1:p1, w1:pB (after p9)
+my $TAB  = qr/\A($WS):t[A-Za-z0-9]+\z/;  # tab id: w1:t1, w1:tG (after t9)
 my $NAME = qr/\A[a-z][a-z0-9_-]{0,31}\z/;    # agent name
 
 # The label must start with "<emoji> <TAG>", then end of string or " · ".
