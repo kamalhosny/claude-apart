@@ -358,6 +358,13 @@ sub _utf8 { my $c = $_[0] > 0x10FFFF ? 0xFFFD : $_[0]; my $s = chr($c); utf8::en
 my %VIEW;
 our $VIEW_OFF = 0;
 
+# Words that hold a live command substitution: $(…) or a backtick inside
+# double quotes, not backslashed. ('…' and \` are plain text to the shell.)
+# The same text written both ways counts as live. Guard uses it to tell real
+# code from data once quoting goes past its depth limit.
+my %LIVE;
+sub live { return $LIVE{ $_[0] } ? 1 : 0 }
+
 sub _inert { (my $v = $_[0]) =~ tr/{,}/\x1c\x1d\x1e/; return $v }
 sub brace_view { return (!$VIEW_OFF && exists $VIEW{ $_[0] }) ? $VIEW{ $_[0] } : $_[0] }
 
@@ -387,17 +394,18 @@ sub _remember_view {
 sub shell_words {
     my ($s, $in_body) = @_;
     my @w;
-    my ($cur, $view, $have) = ('', '', 0);
+    my ($cur, $view, $have, $live) = ('', '', 0, 0);
     my @pending;                  # [delimiter, strip tabs] waiting for their body
     my ($want, $arith) = (0, 0);  # want: [strip tabs] while the next word is a delimiter
     my $flush = sub {
         if ($have) {
             push @w, [ $cur, 0 ];
             _remember_view($cur, $view);
+            $LIVE{$cur} = 1 if $live;
             push @pending, [ $cur, $want->[0] ] if $want;
             $want = 0;
         }
-        ($cur, $view, $have) = ('', '', 0);
+        ($cur, $view, $have, $live) = ('', '', 0, 0);
     };
     my $add = sub { $cur .= $_[0]; $view .= $_[1] ? _inert($_[0]) : $_[0]; $have = 1 };
     pos($s) = 0;
@@ -429,6 +437,8 @@ sub shell_words {
         elsif ($s =~ /\G'([^']*)'?/gc) { $add->($1, 1) }
         elsif ($s =~ /\G\$?"((?:[^"\\]+|\\.)*)"?/gcs) {
             my $q = $1;
+            (my $bare = $q) =~ s/\\.//gs;
+            $live = 1 if $bare =~ /`|\$\(/;
             $q =~ s/\\([\$`"\\\n])/$1 eq "\n" ? '' : $1/ge;
             $add->($q, 1);
         }

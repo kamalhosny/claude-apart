@@ -212,17 +212,24 @@ sub _analyse {
     return $sh;
 }
 
-# Does a word hold shell code to analyse one level deeper? Code nested
-# deeper than $MAX_DEPTH cannot be checked, so that is an error (blocks).
+# Does a word hold shell code to analyse one level deeper? 1: yes. Past
+# $MAX_DEPTH it cannot be analysed. Then, if the word is surely code ($hard:
+# every level down to it is the code of a shell -c / eval, or a live $(…) or
+# backtick), that is an error (blocks). If it is only maybe code (a quoted
+# message, a JSON body, a grep pattern with quote characters), the answer is
+# -1: the caller scans it flat, as free text (its paths and cd targets still
+# count, its command structure does not).
 sub _nested {
-    my ($w, $depth) = @_;
+    my ($w, $depth, $hard) = @_;
     return 0 unless $w =~ $CODE;
-    die "shell code nested too deep\n" if $depth >= $MAX_DEPTH;
-    return 1;
+    return 1 if $depth < $MAX_DEPTH;
+    die "shell code nested too deep\n" if $hard;
+    return -1;
 }
 
 sub _walk {
-    my ($ctx, $sh, $text, $depth, $exec, $sure) = @_;
+    my ($ctx, $sh, $text, $depth, $exec, $sure, $hard) = @_;
+    $hard = 1 unless defined $hard;
     my ($words, $redirs, $want_target) = ([], [], 0);
     my (@wsoft, @rsoft);    # R40 (b): the word is in a heredoc body
     my $pipe = [];          # words of the earlier commands of this pipeline
@@ -233,8 +240,8 @@ sub _walk {
             exec      => $exec,
             code      => $sure,
             pipe_in   => [@$pipe],
-            words     => [ map { _item($ctx, $sh, $words->[$_], $depth, $exec, $sure, $code[$_], $wsoft[$_]) } 0 .. $#$words ],
-            redirects => [ map { _item($ctx, $sh, $redirs->[$_], $depth, $exec, $sure, 0, $rsoft[$_]) } 0 .. $#$redirs ],
+            words     => [ map { _item($ctx, $sh, $words->[$_], $depth, $exec, $sure, $code[$_], $wsoft[$_], $hard) } 0 .. $#$words ],
+            redirects => [ map { _item($ctx, $sh, $redirs->[$_], $depth, $exec, $sure, 0, $rsoft[$_], $hard) } 0 .. $#$redirs ],
         };
         ($words, $redirs) = ([], []);
         @wsoft = @rsoft = ();
@@ -265,16 +272,22 @@ sub _walk {
 # $(…) or backticks; a word that is only maybe code (a quoted message) gives
 # segments that are not (the new-terminal and Keychain rules skip those).
 sub _item {
-    my ($ctx, $sh, $w, $depth, $exec, $seg_code, $code, $body) = @_;
+    my ($ctx, $sh, $w, $depth, $exec, $seg_code, $code, $body, $hard) = @_;
     local $ClaudeApart::Paths::BRACE_SOFT = $body ? 1 : $ClaudeApart::Paths::BRACE_SOFT;
     my @sp = map { _piece($ctx, $sh, $_) } ClaudeApart::Paths::word_pieces($w);
-    my $nested = _nested($w, $depth);
+    my $whard = ($hard && ($code || ClaudeApart::Paths::live($w))) ? 1 : 0;
+    my $nested = _nested($w, $depth, $whard);
+    if ($nested < 0) {    # maybe code past the depth limit: its paths, as free text
+        local $ClaudeApart::Paths::BRACE_SOFT = 1;
+        push @sp, map { _piece($ctx, $sh, $_) } ClaudeApart::Paths::path_candidates($w);
+        $nested = 0;
+    }
     my $braces = !$nested && _quoted_braces($w);
     if ($nested || $braces) {
         my $sure = ($code || $w =~ /\$\(|`/) ? 1 : 0;
         local $ClaudeApart::Paths::BRACE_SOFT = $sure ? 0 : 1;
         local $ClaudeApart::Paths::VIEW_OFF = $braces ? 1 : $ClaudeApart::Paths::VIEW_OFF;
-        _walk($ctx, $sh, $w, $depth + 1, ($exec && $w =~ /\$\(|`/) ? 1 : 0, ($seg_code && $sure) ? 1 : 0);
+        _walk($ctx, $sh, $w, $depth + 1, ($exec && $w =~ /\$\(|`/) ? 1 : 0, ($seg_code && $sure) ? 1 : 0, $whard);
     }
     return { w => $w, sp => [ ClaudeApart::Paths::uniq(@sp) ], nested => ($nested || $braces) ? 1 : 0 };
 }
@@ -466,14 +479,27 @@ my $CD_WORD = qr/(?:\A|=)(?:cd|pushd|chdir)\z/;
 my $CDPATH_SET = qr/\A(?:CDPATH|cdpath)\+?=/;
 
 sub _cd_scan {
-    my ($text, $depth, $out) = @_;
+    my ($text, $depth, $out, $hard) = @_;
+    $hard = 1 unless defined $hard;
     my @tok = ClaudeApart::Paths::shell_words($text);
+    my ($shell, $code) = (0, 0);    # as in _code_flags, per simple command
     for my $i (0 .. $#tok) {
         my ($w, $op) = @{ $tok[$i] };
-        next if $op;
+        if ($op) {
+            (my $rest = $w) =~ s/&?[<>]+[&|]?//g;
+            ($shell, $code) = (0, 0) if length $rest;
+            next;
+        }
         my $c = ClaudeApart::Paths::climb_ub($w);
         $out->{climb} = $c if $c > $out->{climb};
-        _cd_scan($w, $depth + 1, $out) if _nested($w, $depth);
+        my $whard = ($hard && ($code || ClaudeApart::Paths::live($w))) ? 1 : 0;
+        my $n = _name($w) // '';
+        if    ($EVAL_NAME{$n})  { $code  = 1 }
+        elsif ($SHELL_NAME{$n}) { $shell = 1 }
+        elsif ($shell && $w =~ /\A-[A-Za-z]*c[A-Za-z]*\z/) { $code = 1 }
+        my $deeper = _nested($w, $depth, $whard);
+        if    ($deeper > 0) { _cd_scan($w, $depth + 1, $out, $whard) }
+        elsif ($deeper < 0) { _cd_flat($w, $out) }
         if ($w =~ $CDPATH_SET) {
             my $v = substr($w, $+[0]);
             if (!length $v && $i < $#tok && $tok[ $i + 1 ][1] && $tok[ $i + 1 ][0] =~ /\A\(/) {    # cdpath=(a b)
@@ -487,6 +513,26 @@ sub _cd_scan {
         push @{ $out->{targets} }, '~' if $bare && $w !~ /pushd\z/;    # a bare pushd swaps two old folders
         push @{ $out->{targets} }, map { _cd_forms($_) } @$args;
         push @{ $out->{swaps} }, [ @$args[ 0, 1 ] ] if @$args > 1;
+    }
+}
+
+# The cd targets of a text that is only maybe code and lies past the depth
+# limit (see _nested): every quote and backslash is dropped, and each word
+# after a cd, up to the next operator, counts as a target. More targets than
+# a shell would see, never fewer.
+sub _cd_flat {
+    my ($w, $out) = @_;
+    (my $t = $w) =~ s/[\\'"]//g;
+    my @x = $t =~ /([;&|()<>`\n]+|[^ \t\n\r\f\x0b;&|()<>`]+)/g;
+    for my $i (0 .. $#x) {
+        push @{ $out->{cdpath} }, split(/:/, substr($x[$i], $+[0])) if $x[$i] =~ $CDPATH_SET;
+        next unless $x[$i] =~ $CD_WORD;
+        my @a;
+        for (my $j = $i + 1; $j <= $#x && $x[$j] !~ /\A[;&|()<>`\n]/; $j++) {
+            push @a, $x[$j] unless $x[$j] eq '--' || $x[$j] =~ /\A-[LPqes@]+\z/;
+        }
+        push @{ $out->{targets} }, '~' if !@a && $x[$i] !~ /pushd\z/;
+        push @{ $out->{targets} }, map { _cd_forms($_) } @a;
     }
 }
 

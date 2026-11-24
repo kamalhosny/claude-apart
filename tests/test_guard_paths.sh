@@ -658,6 +658,25 @@ test_cd_nesting_too_deep() { # code nested past the depth limit is a guard error
   assert_eq died "$OUT" "_walk dies past the depth limit" || return 1
 }
 
+test_deep_quoted_data_is_not_an_error() { # data quoted past the depth limit is scanned flat, not a guard error
+  t_two_profiles
+  mkdir -p "$HOME/repo/app"
+  local nl=$'\n'
+  local pat="['\\\"\\\`/]"    # a regex class of quote characters, as typed inside "…": ['\"\`/]
+  _sh work "grep -rn \"api/v1/car_parks${pat}\\|api/v1/car_park_groups${pat}\" app | head" "$HOME/repo"
+  _allowed "a grep pattern with quote characters" || return 1
+  _sh work "cat > out.json <<'EOF'${nl}{\"command\":\"grep -rn \\\"api/v1/car_parks['\\\\\\\"\\\\\`/]\\\" . | head\"}${nl}EOF" "$HOME/repo"
+  _allowed "the same pattern inside a JSON heredoc" || return 1
+  _sh work "grep -n \"a${pat}\\|cd ~; cat .claude/x${pat}\" app/f" "$HOME/repo"
+  _blocked "a cd and a denied path in data past the limit still count" || return 1
+  _sh work "grep -n \"a${pat}\\|b ../.claude/x${pat}\" app/f" "$HOME/repo"
+  _blocked "a denied path in data past the limit still counts" || return 1
+  _sh work 'bash -c "bash -c '"'"'bash -c \"eval cat\\ x\"'"'"'"' "$HOME/repo"
+  _guard_error "real code past the depth limit stays a guard error" || return 1
+  _sh work 'echo "`echo \"\`echo \\\"\\\`echo \\\\\\\"\\\\\\\`echo a b\\\\\\\`\\\\\\\"\\\`\\\"\`\"`"' "$HOME/repo"
+  _guard_error "live substitutions past the depth limit stay a guard error" || return 1
+}
+
 _stub_verdict() { # <tool> <json input> <cwd>: verdict with getpwnam("someone") stubbed to $HOME
   run perl -I"$REPO/lib" -MJSON::PP -MClaudeApart::Guard -MClaudeApart::Config -e '
     $ClaudeApart::Paths::USER_HOME = sub { $_[0] eq "someone" ? $ENV{HOME} : undef };
