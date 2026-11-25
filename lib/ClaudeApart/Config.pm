@@ -177,6 +177,23 @@ sub tool_root {
     return Cwd::abs_path(dirname(dirname(dirname(Cwd::abs_path(__FILE__)))));
 }
 
+# The tool tree, and (R19/R67 (3)) the literal CLAUDE_APART_HOME spelling
+# when it is the same folder through a link (a canonical-only rule would miss
+# that spelling).
+sub tool_roots {
+    my $root = tool_root();
+    my @roots = ($root);
+    my $lit = (defined $ENV{CLAUDE_APART_HOME} && length $ENV{CLAUDE_APART_HOME})
+        ? $ENV{CLAUDE_APART_HOME} : "$ENV{HOME}/.local/share/claude-apart";
+    $lit =~ s{/+\z}{};
+    if ($lit =~ m{^/} && $lit ne $root) {
+        require Cwd;
+        my $c = Cwd::abs_path($lit);
+        push @roots, $lit if defined $c && $c eq $root;
+    }
+    return @roots;
+}
+
 sub foreign_paths {
     my ($cfg, $name) = @_;
     my $me = profile($cfg, $name) or die "unknown profile: $name\n";
@@ -188,18 +205,7 @@ sub foreign_paths {
     my $cdir = dirname(config_path());
     push @write, $cdir;
     # R66: the installed tool tree (guard code included) is never writable from a session
-    my $root = tool_root();
-    push @write, $root;
-    # R19/R67 (3): also the literal CLAUDE_APART_HOME spelling when it is the
-    # same folder through a link (a canonical-only rule would miss that spelling).
-    my $lit = (defined $ENV{CLAUDE_APART_HOME} && length $ENV{CLAUDE_APART_HOME})
-        ? $ENV{CLAUDE_APART_HOME} : "$ENV{HOME}/.local/share/claude-apart";
-    $lit =~ s{/+\z}{};
-    if ($lit =~ m{^/} && $lit ne $root) {
-        require Cwd;
-        my $c = Cwd::abs_path($lit);
-        push @write, $lit if defined $c && $c eq $root;
-    }
+    push @write, tool_roots();
     my %can = map { $_ => 1 } @{ $me->{can_read} };
     my @read;
     for my $o (profile_names($cfg)) {

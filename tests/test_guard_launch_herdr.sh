@@ -433,6 +433,23 @@ git --git-dir=$G worktree remove x
 EOF
 }
 
+test_own_launcher_by_install_path() { # the own launcher run by its full path in the tool tree is not a write there
+  t_two_profiles
+  local root; root=$(cd "$REPO" && pwd -P)
+  _allows work "$root/bin/claude-work -p x" "\"$root/bin/claude-work\" --print /standup --add-dir /tmp < /dev/null" \
+    "$root/bin/claude -p x" "nohup $root/bin/claude-work -p x &" "cd /tmp && $root/bin/claude-work -p x > out.txt 2>&1" || return 1
+  _allows personal "$root/bin/claude-personal -p x" || return 1
+  # another profile's launcher stays blocked, by path too
+  _blocks work "$root/bin/claude-personal -p x" || return 1
+  _blocks personal "$root/bin/claude-work -p x" || return 1
+  # only the launcher itself: no other file of the tool tree, no write into it, no other word that names it
+  _blocks work "$root/bin/claude-apart sync" "$root/libexec/claude-apart/wrapper.sh -p x" \
+    "$root/bin/claude-work -p x > $root/bin/out" "$root/bin/claude-work -p x --add-dir $root" \
+    "$root/bin/claude-work -p \"rm $root/bin/claude\"" "PATH=/x $root/bin/claude-work -p x" \
+    "env $root/bin/claude-work -p x" "cp /tmp/x $root/bin/claude-work" "$root/bin/claude-work-x -p x" \
+    "$root/bin/claude-work -p x; touch $root/x" || return 1
+}
+
 test_typed_text_launchers() { # R54 (b): a claude-… command typed into a pane must be the own launcher
   t_two_profiles
   _herdr_std

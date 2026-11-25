@@ -74,6 +74,7 @@ sub _context {
         write   => ClaudeApart::Paths::root_set(@$wd),
         wonly   => ClaudeApart::Paths::root_set(grep { !$r{$_} } @$wd),
         names   => { map { $_ => 1 } ClaudeApart::Config::profile_names($cfg) },
+        tool_roots => [ ClaudeApart::Config::tool_roots() ],
     };
 }
 
@@ -607,6 +608,10 @@ sub _rule_read_denied {
 
 # R26: a command that mentions a readable but write-denied root may only run
 # read-only commands, and no redirect may point into a write-denied root.
+# R77: the session's own launcher, run by its full path in the tool tree
+# (<tool root>/bin/claude-<own profile>), is a run too: it is the same
+# program a bare `claude-<own profile>` finds on PATH (see
+# _runs_own_launcher).
 sub _rule_write_denied {
     my ($ctx, $sh) = @_;
     my $w = $ctx->{wonly};
@@ -614,7 +619,7 @@ sub _rule_write_denied {
     return 0 unless ClaudeApart::Paths::text_hits($w, $sh->{text})
         || ClaudeApart::Paths::set_holds($w, @{ $sh->{spellings} });
     for my $seg (grep { $_->{exec} } @{ $sh->{segments} }) {
-        return 1 unless _read_only($seg);
+        return 1 unless _read_only($seg) || _runs_own_launcher($ctx, $seg);
         for my $r (@{ $seg->{redirects} }) {
             return 1 if ClaudeApart::Paths::text_hits($ctx->{write}, $r->{w})
                 || ClaudeApart::Paths::set_holds($ctx->{write}, @{ $r->{sp} });
@@ -880,6 +885,32 @@ sub _rule_launcher {
         }
     }
     return 0;
+}
+
+# R77: is this simple command a plain run of the own launcher by its path in
+# the tool tree: <tool root>/bin/claude or <tool root>/bin/claude-<own>?
+# Only the command word may name a write-denied root: no other word (an
+# --add-dir, a path in the prompt) may. No VAR=… word and no env or sudo in
+# front (they change what runs or who runs it); nohup, time, timeout and the
+# like pass. Redirects are checked by the caller. Another profile's launcher
+# never matches, and _rule_launcher blocks it by name anyway.
+sub _runs_own_launcher {
+    my ($ctx, $seg) = @_;
+    my @it = @{ $seg->{words} };
+    my @w  = map { $_->{w} } @it;
+    my $ci = _cmd_index(\@w);
+    return 0 if $ci > $#w || $it[$ci]{nested};
+    for my $j (0 .. $ci - 1) {
+        return 0 if $w[$j] =~ $ASSIGN || (_name($w[$j]) // '') =~ /\A(?:env|sudo)\z/;
+    }
+    my %own = map { ("$_/bin/claude" => 1, "$_/bin/claude-$ctx->{profile}" => 1) } @{ $ctx->{tool_roots} };
+    return 0 unless grep { $own{$_} } @{ $it[$ci]{sp} };
+    my $wo = $ctx->{wonly};
+    for my $j (grep { $_ != $ci } 0 .. $#it) {
+        return 0 if ClaudeApart::Paths::text_hits($wo, $w[$j])
+            || ClaudeApart::Paths::set_holds($wo, @{ $it[$j]{sp} });
+    }
+    return 1;
 }
 
 # R42: does the `claude-apart` at $k change profile setup (see _rule_launcher)?
